@@ -251,16 +251,20 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 	}
 }
 
-// buildCode generates the implementation from an approved design and applies it.
+// buildCode generates the implementation from an approved design and applies it,
+// streaming a live per-file view so you can watch each file being written.
 func (s *session) buildCode(design string) {
 	prov := s.builder()
-	sp := startSpinner("Generating code with " + prov.Name())
-	code, err := runModel(s.ctx, prov, buildPrompt, buildUserMessage(design, s.profile, s.fileMap), nil, sp)
+	info("Generating code with " + prov.Name())
+	os.Stderr.WriteString("\n")
+	cs := newCodeStream()
+	code, err := runModel(s.ctx, prov, buildPrompt, buildUserMessage(design, s.profile, s.fileMap), cs, nil)
+	cs.flush()
 	if err != nil {
-		sp.Abort()
 		failf("%v", err)
 	}
-	sp.Stop("Code generated")
+	os.Stderr.WriteString("\n")
+	ok("Code generated")
 	if err := applyChanges(s.root, parseFileBlocks(code), s.yes); err != nil {
 		failf("%v", err)
 	}

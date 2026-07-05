@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,6 +219,28 @@ func TestParseFileBlocks(t *testing.T) {
 	}
 	if fcs[1].path != "old/legacy.go" || !fcs[1].del {
 		t.Errorf("delete block parsed wrong: %+v", fcs[1])
+	}
+}
+
+func TestCodeStreamRender(t *testing.T) {
+	var buf bytes.Buffer
+	cs := &codeStreamWriter{w: &buf}
+	// Feed the stream in two chunks, splitting a line mid-way, to exercise buffering.
+	cs.Write([]byte("=== FILE: internal/x.go ===\n```go\npack"))
+	cs.Write([]byte("age x\nfunc F() {}\n```\n=== DELETE: old.go ===\n"))
+	cs.flush()
+	out := buf.String()
+	if !strings.Contains(out, "internal/x.go") {
+		t.Errorf("missing file header: %q", out)
+	}
+	if !strings.Contains(out, "package x") || !strings.Contains(out, "func F() {}") {
+		t.Errorf("missing streamed code: %q", out)
+	}
+	if !strings.Contains(out, "delete old.go") {
+		t.Errorf("missing delete line: %q", out)
+	}
+	if strings.Contains(out, "```") {
+		t.Errorf("fence lines should be dropped: %q", out)
 	}
 }
 
