@@ -1,0 +1,97 @@
+// Command archi is a software architect that knows your codebase. Run
+// `archi init` once to learn a repository, then `archi design "<request>"` to
+// get design documents — briefings, Mermaid diagrams, and plans — grounded in
+// your real modules, stack, and conventions.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+const version = "1.0.0"
+
+func main() {
+	if len(os.Args) < 2 {
+		printHelp()
+		return
+	}
+	switch os.Args[1] {
+	case "init":
+		cmdInit(os.Args[2:])
+	case "design":
+		cmdDesign(os.Args[2:])
+	case "status":
+		cmdStatus(os.Args[2:])
+	case "version", "-version", "--version", "-v":
+		fmt.Println("archi", version)
+	case "help", "-h", "--help":
+		printHelp()
+	default:
+		fmt.Fprintln(os.Stderr, "  "+red("✗")+" unknown command "+bold(os.Args[1]))
+		printHelp()
+		os.Exit(2)
+	}
+}
+
+func printHelp() {
+	banner()
+	fmt.Fprint(os.Stderr, `
+  `+bold("USAGE")+`
+    archi <command> [flags]
+
+  `+bold("COMMANDS")+`
+    `+cyan("init")+`   [path]        Learn a codebase — scan it and cache an understanding
+    `+cyan("design")+` "<request>"   Design a change, grounded in the learned codebase
+    `+cyan("status")+`               Show what archi has learned about this repo
+    `+cyan("version")+`              Print the version
+
+  `+bold("QUICK START")+`
+    `+dim("$")+` cd my-service
+    `+dim("$")+` archi init
+    `+dim("$")+` archi design "add webhooks with retries and signature verification"
+
+  `+bold("EXAMPLES")+`
+    archi init ./api                       `+dim("learn a subdirectory")+`
+    archi design "make orders idempotent"  `+dim("design against the whole repo")+`
+    archi design -focus 'internal/pay/**' "add refunds"
+    archi design "add search" -o design.md `+dim("write to a file")+`
+    echo "add rate limiting" | archi design
+
+  `+bold("SETUP")+`
+    Ollama Cloud (default):  export OLLAMA_API_KEY=...   `+dim("or OLLAMA_HOST for local")+`
+    Anthropic:               export ANTHROPIC_API_KEY=... `+dim("(-provider anthropic)")+`
+
+  `+dim("Docs: https://github.com/devthedeveloper/archi")+`
+
+`)
+}
+
+func initUsage() {
+	fmt.Fprint(os.Stderr, `usage: archi init [path]
+
+  Scan a repository and cache an understanding in .archi/.
+
+  -provider string   LLM provider: ollama or anthropic (default "ollama")
+  -model string      model id (default: provider default)
+  -force             rebuild even if .archi already exists
+  -max-file-kb int   skip files larger than this when sampling (default 256)
+`)
+}
+
+func designUsage() {
+	fmt.Fprint(os.Stderr, `usage: archi design [flags] [request]
+
+  Produce a design document grounded in the learned codebase. The request may be
+  given as arguments, with -f <file>, or piped on stdin.
+
+  -focus glob        include matching files as extra grounding (repeatable)
+  -f string          read the request from this file
+  -o string          write the design to this file instead of stdout
+  -provider string   override provider (default: from .archi)
+  -model string      override model (default: from .archi)
+  -temp float        sampling temperature (default 0.4)
+  -max-tokens int    max output tokens (default 8000)
+  -no-stream         wait for the full response instead of streaming
+`)
+}

@@ -1,0 +1,45 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+)
+
+func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, "usage: archi status") }
+	fs.Parse(args)
+
+	root := "."
+	if !isInitialized(root) {
+		banner()
+		warn("Not initialized here.")
+		fmt.Fprintln(os.Stderr, "  "+dim("Run ")+cyan("archi init")+dim(" to get started."))
+		return
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		failf("%v", err)
+	}
+
+	banner()
+	line := func(k, v string) { fmt.Fprintf(os.Stderr, "  %-14s %s\n", dim(k), v) }
+	line("provider", cfg.Provider+"/"+cfg.Model)
+	line("initialized", cfg.InitializedAt)
+	line("files", humanCount(cfg.FileCount)+dim("  ·  ~"+humanCount(cfg.ApproxTokens)+" tokens"))
+	os.Stderr.WriteString("\n")
+
+	// Live language bars from the cached totals.
+	stats := make([]langStat, 0, len(cfg.Languages))
+	total := 0
+	for name, tok := range cfg.Languages {
+		stats = append(stats, langStat{name: name, tokens: tok})
+		total += tok
+	}
+	sortLangStats(stats)
+	langBars(stats, total, false)
+
+	os.Stderr.WriteString("\n")
+	info("Design something:  " + cyan(`archi design "add …"`))
+}
