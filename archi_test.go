@@ -175,3 +175,67 @@ func TestDesignUserMessageStructure(t *testing.T) {
 		}
 	}
 }
+
+func TestParseQuestions(t *testing.T) {
+	in := `Q: How many orders per second at peak?
+Why: above ~5k/s we need sharding, below it a single Postgres is fine
+Options: <1k, 1k-5k, >5k
+---
+Q: Must delivery be exactly-once?
+Why: exactly-once needs an outbox; at-least-once is simpler
+Options: exactly-once, at-least-once
+---
+garbage block with no question`
+	qs := parseQuestions(in)
+	if len(qs) != 2 {
+		t.Fatalf("expected 2 questions, got %d", len(qs))
+	}
+	if !strings.Contains(qs[0].Q, "orders per second") || qs[0].Options != "<1k, 1k-5k, >5k" {
+		t.Errorf("first question parsed wrong: %+v", qs[0])
+	}
+	if qs[1].Why == "" {
+		t.Error("expected a Why on the second question")
+	}
+}
+
+func TestParseFileBlocks(t *testing.T) {
+	in := "here is noise\n" +
+		"=== FILE: internal/cache/cache.go ===\n" +
+		"```go\n" +
+		"package cache\n\nfunc Get() {}\n" +
+		"```\n" +
+		"=== DELETE: old/legacy.go ===\n" +
+		"trailing chatter"
+	fcs := parseFileBlocks(in)
+	if len(fcs) != 2 {
+		t.Fatalf("expected 2 changes, got %d", len(fcs))
+	}
+	if fcs[0].path != "internal/cache/cache.go" || !strings.Contains(fcs[0].content, "package cache") {
+		t.Errorf("file block parsed wrong: %+v", fcs[0])
+	}
+	if fcs[0].del {
+		t.Error("first block should not be a delete")
+	}
+	if fcs[1].path != "old/legacy.go" || !fcs[1].del {
+		t.Errorf("delete block parsed wrong: %+v", fcs[1])
+	}
+}
+
+func TestSafeRel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"internal/x.go", true},
+		{"x.go", true},
+		{"../escape.go", false},
+		{"/etc/passwd", false},
+		{"a/../../b.go", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if _, ok := safeRel(c.in); ok != c.want {
+			t.Errorf("safeRel(%q) ok = %v, want %v", c.in, ok, c.want)
+		}
+	}
+}

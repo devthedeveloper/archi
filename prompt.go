@@ -131,3 +131,77 @@ func designUserMessage(profileMD, mapMD string, focus []seedFile, request string
 	b.WriteString("\n\nProduce the design document now, grounded in the codebase above.")
 	return b.String()
 }
+
+const clarifyPrompt = `You are a principal architect embedded in a specific codebase. Before you design
+anything, you interview the requester to remove the ambiguity that would otherwise
+lead to the wrong design. You are given the codebase profile, its file map, and a
+change request.
+
+Ask the 3 to 6 MOST decision-critical questions — the ones whose answers would change
+the architecture, not cosmetic preferences. Ground them in this codebase. For each,
+give a one-line scenario showing why the answer matters (how the design forks on it),
+and suggest concrete options.
+
+Output ONLY question blocks in EXACTLY this format, separated by a line with three
+dashes. No preamble, no numbering, nothing else:
+
+Q: <the question>
+Why: <one line — how the design changes depending on the answer>
+Options: <comma-separated concrete options, or the word open>
+---
+Q: <next question>
+Why: ...
+Options: ...`
+
+const answerPrompt = `You are a principal architect discussing a design you just produced for a specific
+codebase. Answer the user's question directly and concisely, grounded in the design
+and the codebase. Do NOT rewrite the design document — just answer. Use short
+paragraphs or bullets. If the question reveals the design should change, say so in one
+line at the end, prefixed "Suggest:".`
+
+const buildPrompt = `You are a senior engineer implementing an APPROVED design in a specific codebase. You
+are given the design, the codebase profile, and its file map. Produce the actual code
+changes that implement the design, matching the codebase's existing conventions,
+style, and structure.
+
+Output ONLY file blocks — no prose, no explanation, before, between, or after. For
+each file to create or replace, output its FULL contents:
+
+=== FILE: relative/path/from/repo/root ===
+` + "```" + `language
+<complete file contents>
+` + "```" + `
+
+To delete a file, output a single line:
+
+=== DELETE: relative/path ===
+
+Rules: full file contents (never diffs or ellipses). Real paths from the map. Keep
+changes minimal and idiomatic. Include any new tests the design calls for.`
+
+// clarifyUserMessage assembles the interview request.
+func clarifyUserMessage(profileMD, mapMD string, focus []seedFile, request string) string {
+	return designUserMessage(profileMD, mapMD, focus, request) + "\n\nAsk your clarifying questions now, in the required block format."
+}
+
+// reviseUserMessage asks the model to revise a design given requested changes.
+func reviseUserMessage(design, changes string) string {
+	return "=== CURRENT DESIGN ===\n\n" + design +
+		"\n\n=== REQUESTED CHANGES ===\n\n" + changes +
+		"\n\nOutput the FULL revised design document, same section structure, incorporating the changes."
+}
+
+// questionUserMessage assembles a question about the current design.
+func questionUserMessage(design, profileMD, question string) string {
+	return "=== DESIGN ===\n\n" + design +
+		"\n\n=== CODEBASE PROFILE ===\n\n" + profileMD +
+		"\n\n=== QUESTION ===\n\n" + question + "\n\nAnswer now."
+}
+
+// buildUserMessage assembles the code-generation request from an approved design.
+func buildUserMessage(design, profileMD, mapMD string) string {
+	return "=== APPROVED DESIGN ===\n\n" + design +
+		"\n\n=== CODEBASE PROFILE ===\n\n" + profileMD +
+		"\n\n=== FILE MAP ===\n\n" + mapMD +
+		"\n\nGenerate the code now, in the required file-block format only."
+}

@@ -16,16 +16,24 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
+// providerFactory builds a provider at a chosen output-token budget. The
+// interview and design fit in a normal budget; code generation needs more room.
+type providerFactory func(maxTokens int) Provider
+
 func cmdDesign(args []string) {
 	fs := flag.NewFlagSet("design", flag.ExitOnError)
 	var focus stringList
 	fs.Var(&focus, "focus", "glob of files to include as extra grounding (repeatable)")
 	file := fs.String("f", "", "read the request from this file")
 	out := fs.String("o", "", "write the design to this file instead of stdout")
+	htmlFile := fs.String("html", "", "also render the design to a standalone HTML file (drawn diagrams)")
 	provider := fs.String("provider", "", "override provider (default: from .archi)")
 	model := fs.String("model", "", "override model (default: from .archi)")
 	temp := fs.Float64("temp", 0.4, "sampling temperature")
-	maxTokens := fs.Int("max-tokens", 8000, "max output tokens")
+	maxTokens := fs.Int("max-tokens", 8000, "max output tokens for the design")
+	noInteractive := fs.Bool("no-interactive", false, "skip the interview and review loop")
+	build := fs.Bool("build", false, "after designing, generate the code (non-interactive)")
+	yes := fs.Bool("yes", false, "auto-approve writing generated files")
 	noStream := fs.Bool("no-stream", false, "wait for the full response instead of streaming")
 	fs.Usage = func() { designUsage() }
 	fs.Parse(args)
@@ -39,11 +47,9 @@ func cmdDesign(args []string) {
 		failf("reading .archi: %v", err)
 	}
 
-	// Resolve the request text: args > -f > stdin.
 	var fileData []byte
 	if *file != "" {
-		fileData, err = os.ReadFile(*file)
-		if err != nil {
+		if fileData, err = os.ReadFile(*file); err != nil {
 			failf("%v", err)
 		}
 	}
@@ -52,7 +58,7 @@ func cmdDesign(args []string) {
 		failf("%v", err)
 	}
 
-	// Provider: flags override what init stored.
+	// Resolve the backend; flags override what init stored.
 	pName, pModel := cfg.Provider, cfg.Model
 	if *provider != "" {
 		pName, pModel = *provider, ""
@@ -60,9 +66,12 @@ func cmdDesign(args []string) {
 	if *model != "" {
 		pModel = *model
 	}
-	prov, err := newProvider(pName, pModel, *temp, *maxTokens)
-	if err != nil {
+	if _, err := newProvider(pName, pModel, *temp, *maxTokens); err != nil {
 		failf("%v", err)
+	}
+	mk := func(mt int) Provider {
+		p, _ := newProvider(pName, pModel, *temp, mt)
+		return p
 	}
 
 	mapMD, err := os.ReadFile(mapPath(root))
@@ -73,53 +82,157 @@ func cmdDesign(args []string) {
 	if err != nil {
 		failf("reading profile: %v (try %s)", err, cyan("archi init -force"))
 	}
-
-	// Optional focus files.
 	var focusFiles []seedFile
 	if len(focus) > 0 {
 		focusFiles = collectFocus(root, focus)
 	}
 
-	user := designUserMessage(string(profileMD), string(mapMD), focusFiles, request)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// Where the finished document goes.
+	sess := &session{
+		ctx: ctx, mk: mk, root: root, cfg: cfg,
+		profile: string(profileMD), fileMap: string(mapMD), focus: focusFiles,
+		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
+	}
+
+	interactive := stdoutTTY && isTTY(os.Stdin) && !*noInteractive && *out == ""
+	if interactive {
+		sess.runInteractive(request)
+		return
+	}
+	sess.runOneShot(request, *out, *build, *noStream)
+}
+
+// session carries everything the design lifecycle needs between phases.
+type session struct {
+	ctx       context.Context
+	mk        providerFactory
+	root      string
+	cfg       *Config
+	profile   string
+	fileMap   string
+	focus     []seedFile
+	maxTokens int
+	yes       bool
+	htmlFile  string
+}
+
+func (s *session) design() Provider { return s.mk(s.maxTokens) }
+func (s *session) builder() Provider {
+	mt := s.maxTokens
+	if mt < 16000 {
+		mt = 16000 // code generation needs room for full files
+	}
+	return s.mk(mt)
+}
+
+// runInteractive walks interview → design → review loop → build.
+func (s *session) runInteractive(request string) {
+	prov := s.design()
+	banner()
+	info("Interviewing with " + prov.Name() + dim("  ·  "+humanCount(s.cfg.FileCount)+" files known"))
+
+	// Phase 1 — clarify.
+	sp := startSpinner("Working out what to ask")
+	qraw, err := runModel(s.ctx, prov, clarifyPrompt, clarifyUserMessage(s.profile, s.fileMap, s.focus, request), nil, sp)
+	if err != nil {
+		sp.Abort()
+		failf("%v", err)
+	}
+	sp.Stop("Questions ready")
+	answers := askQuestions(parseQuestions(qraw))
+
+	req := request
+	if answers != "" {
+		req = request + "\n\nClarifications from the requester:\n" + answers
+	}
+
+	// Phase 2 — design (streamed live).
+	info("Designing …")
+	os.Stderr.WriteString("\n")
+	doc, err := runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, req), os.Stdout, nil)
+	if err != nil {
+		failf("%v", err)
+	}
+
+	// Phase 3 — review loop.
+	for {
+		switch reviewChoice() {
+		case "a":
+			s.buildCode(doc)
+			s.maybeHTML(doc)
+			return
+		case "m":
+			ch := readLine("what should change?")
+			if ch == "" {
+				continue
+			}
+			info("Revising …")
+			os.Stderr.WriteString("\n")
+			if doc, err = runModel(s.ctx, prov, architectPrompt, reviseUserMessage(doc, ch), os.Stdout, nil); err != nil {
+				failf("%v", err)
+			}
+		case "q":
+			qq := readLine("your question:")
+			if qq == "" {
+				continue
+			}
+			os.Stderr.WriteString("\n")
+			if _, err = runModel(s.ctx, prov, answerPrompt, questionUserMessage(doc, s.profile, qq), os.Stdout, nil); err != nil {
+				failf("%v", err)
+			}
+			os.Stderr.WriteString("\n")
+		case "w":
+			fn := readLine("filename:")
+			if fn == "" {
+				fn = "design.md"
+			}
+			if err := os.WriteFile(fn, []byte(doc), 0o644); err != nil {
+				failf("%v", err)
+			}
+			ok("Wrote " + fn)
+		case "x":
+			s.maybeHTML(doc)
+			ok("Done.")
+			return
+		default:
+			warn("Pick a, m, q, w, or x.")
+		}
+	}
+}
+
+// runOneShot is the scriptable path: design to stdout/-o, optionally build.
+func (s *session) runOneShot(request, outPath string, build, noStream bool) {
+	prov := s.design()
+
 	var target io.Writer = os.Stdout
 	var outFile *os.File
-	if *out != "" {
-		outFile, err = os.Create(*out)
-		if err != nil {
+	if outPath != "" {
+		var err error
+		if outFile, err = os.Create(outPath); err != nil {
 			failf("%v", err)
 		}
 		defer outFile.Close()
 		target = outFile
 	}
 
-	// Live view only when the document is going to an interactive stdout: the
-	// user watches it appear, and the stream itself is the output — no re-print.
-	live := *out == "" && stdoutTTY && !*noStream
+	live := outPath == "" && stdoutTTY && !noStream
 
 	banner()
-	info("Designing with " + prov.Name() + dim("  ·  "+humanCount(cfg.FileCount)+" files known"))
+	info("Designing with " + prov.Name())
 
 	var doc string
+	var err error
 	if live {
-		info(dim("streaming — Ctrl-C to stop"))
 		os.Stderr.WriteString("\n")
-		doc, err = runModel(ctx, prov, architectPrompt, user, os.Stdout, nil)
+		doc, err = runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, request), os.Stdout, nil)
 		if err != nil {
 			failf("%v", err)
 		}
 	} else {
-		var sp *Spinner
-		if !*noStream {
-			sp = startSpinner("Designing")
-		} else {
-			sp = startSpinner("Designing (buffered)")
-		}
-		doc, err = runModel(ctx, prov, architectPrompt, user, nil, sp)
+		sp := startSpinner("Designing")
+		doc, err = runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, request), nil, sp)
 		if err != nil {
 			sp.Abort()
 			failf("%v", err)
@@ -129,30 +242,55 @@ func cmdDesign(args []string) {
 			failf("%v", err)
 		}
 	}
-
 	if outFile != nil {
-		os.Stderr.WriteString("\n")
-		ok("Wrote " + humanCount(strings.Count(doc, "\n")+1) + " lines (~" + humanCount(estimateTokens(doc)) + " tokens) → " + *out)
-	} else if live {
-		os.Stderr.WriteString("\n")
-		ok("Done · ~" + humanCount(estimateTokens(doc)) + " tokens")
+		ok("Wrote ~" + humanCount(estimateTokens(doc)) + " tokens → " + outPath)
+	}
+	s.maybeHTML(doc)
+	if build {
+		s.buildCode(doc)
 	}
 }
 
+// buildCode generates the implementation from an approved design and applies it.
+func (s *session) buildCode(design string) {
+	prov := s.builder()
+	sp := startSpinner("Generating code with " + prov.Name())
+	code, err := runModel(s.ctx, prov, buildPrompt, buildUserMessage(design, s.profile, s.fileMap), nil, sp)
+	if err != nil {
+		sp.Abort()
+		failf("%v", err)
+	}
+	sp.Stop("Code generated")
+	if err := applyChanges(s.root, parseFileBlocks(code), s.yes); err != nil {
+		failf("%v", err)
+	}
+}
+
+func (s *session) maybeHTML(doc string) {
+	if s.htmlFile == "" {
+		return
+	}
+	if err := writeHTMLFile(s.htmlFile, "archi design", doc); err != nil {
+		warn("HTML export failed: " + err.Error())
+		return
+	}
+	ok("Rendered → " + s.htmlFile + dim("  (open in a browser for drawn diagrams)"))
+}
+
 // resolveInput picks the request text by precedence: args, then file, then stdin.
-func resolveInput(args []string, fileData []byte, hasFile bool, stdin io.Reader, stdinIsTTY bool) (string, error) {
+func resolveInput(args []string, fileData []byte, hasFile bool, stdinR io.Reader, stdinIsTTY bool) (string, error) {
 	if j := strings.TrimSpace(strings.Join(args, " ")); j != "" {
 		return j, nil
 	}
 	if hasFile {
-		if s := strings.TrimSpace(string(fileData)); s != "" {
-			return s, nil
+		if str := strings.TrimSpace(string(fileData)); str != "" {
+			return str, nil
 		}
 	}
 	if !stdinIsTTY {
-		b, _ := io.ReadAll(stdin)
-		if s := strings.TrimSpace(string(b)); s != "" {
-			return s, nil
+		b, _ := io.ReadAll(stdinR)
+		if str := strings.TrimSpace(string(b)); str != "" {
+			return str, nil
 		}
 	}
 	return "", errors.New("no request given — pass it as an argument, with -f <file>, or on stdin")

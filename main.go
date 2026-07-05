@@ -9,7 +9,7 @@ import (
 	"os"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -82,16 +82,21 @@ func initUsage() {
 func designUsage() {
 	fmt.Fprint(os.Stderr, `usage: archi design [flags] [request]
 
-  Produce a design document grounded in the learned codebase. The request may be
-  given as arguments, with -f <file>, or piped on stdin.
+  In a terminal, archi interviews you, streams a design, then lets you approve &
+  build the code, modify, or ask questions. Piped or with -no-interactive it just
+  prints the design. Request may be args, -f <file>, or stdin.
 
   -focus glob        include matching files as extra grounding (repeatable)
   -f string          read the request from this file
   -o string          write the design to this file instead of stdout
+  -html string       also render the design to a standalone HTML file (drawn diagrams)
+  -no-interactive    skip the interview and review loop
+  -build             after designing, generate the code (non-interactive)
+  -yes               auto-approve writing generated files
   -provider string   override provider (default: from .archi)
   -model string      override model (default: from .archi)
   -temp float        sampling temperature (default 0.4)
-  -max-tokens int    max output tokens (default 8000)
+  -max-tokens int    max output tokens for the design (default 8000)
   -no-stream         wait for the full response instead of streaming
 `)
 }
