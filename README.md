@@ -85,7 +85,7 @@ archi status                   # what archi has learned here
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-provider` | `ollama` | `ollama` or `anthropic` |
-| `-model` | provider default | model id (`glm-4.6`, `claude-fable-5`, …) |
+| `-model` | provider default | model id (`glm-5.2:cloud`, `claude-fable-5`, …) |
 | `-force` | off | rebuild even if `.archi/` exists |
 | `-max-file-kb` | `256` | skip files larger than this when sampling |
 

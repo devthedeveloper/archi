@@ -11,7 +11,7 @@ import (
 // Provider turns a system + user prompt into a completed document. If progress
 // is non-nil, each streamed chunk is written to it as it arrives.
 type Provider interface {
-	Name() string  // e.g. "ollama/glm-4.6", for display
+	Name() string  // e.g. "ollama/glm-5.2:cloud", for display
 	Model() string // the resolved model id, for config
 	Complete(ctx context.Context, system, user string, progress io.Writer) (string, error)
 }

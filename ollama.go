@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const defaultOllamaModel = "glm-4.6"
+const defaultOllamaModel = "glm-5.2:cloud"
 
 // ollamaProvider talks to Ollama Cloud (or a local Ollama via OLLAMA_HOST)
 // using the /api/chat streaming NDJSON protocol.
