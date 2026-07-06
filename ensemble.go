@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 )
 
 // ensembleOpts is the resolved -agents/-critic-model/-rounds configuration.
@@ -187,25 +186,13 @@ func (s *session) runPanel(critics []Agent, base TaskInput, doc string) []AgentR
 // critic's failure never cancels the others — the panel tolerates each critic
 // independently (spec: "a critic errs ⇒ run continues").
 func runCriticPanel(ctx context.Context, o *Orchestrator, critics []Agent, base TaskInput, design string) []AgentResult {
-	n := o.Concurrency
-	if n <= 0 {
-		n = defaultAgentConcurrency
-	}
-	results := make([]AgentResult, len(critics))
-	sem := make(chan struct{}, n)
-	var wg sync.WaitGroup
+	calls := make([]AgentCall, len(critics))
 	for i, c := range critics {
-		wg.Add(1)
-		go func(i int, c Agent) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			in := base
-			in.Extra = map[string]string{"design": design}
-			results[i] = o.Run(ctx, c, in)
-		}(i, c)
+		in := base
+		in.Extra = map[string]string{"design": design}
+		calls[i] = AgentCall{Agent: c, Input: in}
 	}
-	wg.Wait()
+	results := o.RunPool(ctx, calls)
 	skipped := 0
 	for i := range results {
 		if results[i].Err != nil {

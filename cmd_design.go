@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
@@ -39,6 +40,9 @@ func cmdDesign(args []string) {
 	agents := fs.String("agents", "", "ensemble mode: full, fast, or off (default: from .archi, else full)")
 	criticModel := fs.String("critic-model", "", "cheaper model for critics (default: the design model)")
 	rounds := fs.Int("rounds", 0, "designer↔critic debate rounds, 1-3 (default: from .archi, else 1)")
+	swarm := fs.String("swarm", "", "split the build into parallel packets: on|off (default: on with -agents full)")
+	verifyFlag := fs.String("verify", "on", "run the repo's toolchain after applying: on|off")
+	maxRepair := fs.Int("max-repair", 3, "max verify/repair iterations")
 	fs.Usage = func() { designUsage() }
 	fs.Parse(args)
 
@@ -134,6 +138,9 @@ func cmdDesign(args []string) {
 		profile: profile, fileMap: fileMap, focus: fitFocus,
 		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
 		opts: opts, criticMk: criticMk,
+		swarm:     *swarm == "on" || (*swarm == "" && opts.mode == "full"),
+		verify:    *verifyFlag != "off",
+		maxRepair: *maxRepair,
 	}
 	sess.orch = newOrchestrator(root)
 
@@ -161,6 +168,9 @@ type session struct {
 	orch        *Orchestrator // agent runtime: traces every call, charges the run budget
 	opts        ensembleOpts  // resolved -agents/-critic-model/-rounds
 	criticMk    providerFactory
+	swarm       bool // split the build into parallel packets
+	verify      bool // run the toolchain after applying
+	maxRepair   int  // max verify/repair iterations
 }
 
 // agentFor binds a registered spec to the session's provider for that role
@@ -376,15 +386,25 @@ func (s *session) recordDesign(request, provider, doc string) {
 	}
 }
 
-// buildCode generates the implementation from an approved design and applies it,
-// streaming a live per-file view so you can watch each file being written.
+// buildCode turns an approved design into code. It dispatches to the parallel
+// swarm for big designs, else the single-shot builder, then verifies+repairs.
 func (s *session) buildCode(design string) {
-	prov := s.builder()
 	if s.historyPath != "" {
 		if err := markDesignBuilt(s.historyPath); err != nil {
 			warn("could not update design history: " + err.Error())
 		}
 	}
+	if s.swarm && shouldSwarm(design) {
+		s.buildSwarm(design)
+		return
+	}
+	s.buildSingleShot(design)
+}
+
+// buildSingleShot generates all files in one call, streaming a live per-file
+// view, applies them, and verifies.
+func (s *session) buildSingleShot(design string) {
+	prov := s.builder()
 	info("Generating code with " + prov.Name())
 	os.Stderr.WriteString("\n")
 	cs := newCodeStream()
@@ -396,8 +416,57 @@ func (s *session) buildCode(design string) {
 	}
 	os.Stderr.WriteString("\n")
 	ok("Code generated")
-	if err := applyChanges(s.root, parseFileBlocks(res.Output), s.yes); err != nil {
+	s.applyAndVerify(design, parseFileBlocks(res.Output))
+}
+
+// buildSwarm plans the design into packets, builds them in parallel waves,
+// merges, applies, and verifies. Any planning/swarm failure falls back to the
+// single-shot path.
+func (s *session) buildSwarm(design string) {
+	sp := startSpinner("Planning build with " + s.builder().Name())
+	planAgent := Agent{Spec: AgentSpec{Role: RolePlanner, System: plannerPrompt, MaxTokens: 2000, Temp: 0}, P: s.mk(2000)}
+	res := s.orch.runStream(s.ctx, planAgent, designTask(design, plannerUserMessage(design, s.profile, s.fileMap)), nil, sp)
+	if res.Err != nil {
+		sp.Abort()
+		warn("planning failed: " + res.Err.Error() + " — falling back to single-shot build")
+		s.buildSingleShot(design)
+		return
+	}
+	packets, err := parsePackets(res.Output)
+	if err == nil {
+		err = validatePackets(packets)
+	}
+	if err == nil {
+		_, err = topoLevels(packets)
+	}
+	if err != nil {
+		sp.Abort()
+		warn("planning failed: " + err.Error() + " — falling back to single-shot build")
+		s.buildSingleShot(design)
+		return
+	}
+	sp.Stop(fmt.Sprintf("Plan: %d packets", len(packets)))
+	printPlan(packets)
+
+	merged, results, serr := runSwarm(s.ctx, s.orch, s, design, packets)
+	if serr != nil {
+		warn("swarm build failed: " + serr.Error() + " — falling back to single-shot build")
+		s.buildSingleShot(design)
+		return
+	}
+	reportPackets(results)
+	s.applyAndVerify(design, merged)
+}
+
+// applyAndVerify applies the generated changes and, on success, runs the
+// verify/repair loop when -verify is on.
+func (s *session) applyAndVerify(design string, changes []fileChange) {
+	applied, stamp, err := applyChanges(s.root, changes, s.yes)
+	if err != nil {
 		failf("%v", err)
+	}
+	if applied && s.verify {
+		s.repairLoop(s.ctx, s.orch, design, stamp)
 	}
 }
 

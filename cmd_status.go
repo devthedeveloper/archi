@@ -62,6 +62,11 @@ func cmdStatus(args []string) {
 		}
 	}
 
+	if backups := listBackupRuns(backupsRoot(root)); len(backups) > 0 {
+		os.Stderr.WriteString("\n")
+		line("backups", backups[0].stamp+dim(fmt.Sprintf("  ·  %d runs  ·  archi rollback to restore", len(backups))))
+	}
+
 	os.Stderr.WriteString("\n")
 	info("Design something:  " + cyan(`archi design "add …"`))
 }

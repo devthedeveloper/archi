@@ -2115,3 +2115,474 @@ func TestGroundingCriticEval(t *testing.T) {
 	}
 	t.Skip("eval harness requires a live provider; not run in unit tests")
 }
+
+// ── Phase 3: build swarm, verify, rollback ──────────────────────────────────
+
+func contains(xs []string, x string) bool { return count(xs, x) > 0 }
+
+func fileBlock(path, content string) string {
+	return "=== FILE: " + path + " ===\n```go\n" + content + "\n```\n"
+}
+
+func packetIDFromUser(user string) string {
+	for _, line := range strings.Split(user, "\n") {
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "id: ") {
+			return strings.TrimSpace(strings.TrimPrefix(t, "id: "))
+		}
+	}
+	return ""
+}
+
+// swarmProvider scripts builder responses by packet id.
+type swarmProvider struct {
+	mu       sync.Mutex
+	respond  func(id string) (string, error)
+	log      []string
+	userByID map[string]string
+}
+
+func (p *swarmProvider) Name() string  { return "sw/s" }
+func (p *swarmProvider) Model() string { return "s" }
+func (p *swarmProvider) Complete(ctx context.Context, system, user string, progress io.Writer) (string, error) {
+	id := packetIDFromUser(user)
+	p.mu.Lock()
+	p.log = append(p.log, id)
+	if p.userByID == nil {
+		p.userByID = map[string]string{}
+	}
+	p.userByID[id] = user
+	p.mu.Unlock()
+	out, err := p.respond(id)
+	if progress != nil && out != "" {
+		progress.Write([]byte(out))
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return out, err
+}
+
+func swarmSession(root string, p Provider) *session {
+	mk := func(mt int) Provider { return p }
+	return &session{
+		ctx: context.Background(), mk: mk, criticMk: mk, root: root,
+		profile: "P", fileMap: "M",
+		orch: &Orchestrator{Trace: nopTrace(), started: time.Now()},
+	}
+}
+
+func TestTopoLevels(t *testing.T) {
+	chain := []packet{{ID: "a", Files: []string{"a"}}, {ID: "b", Files: []string{"b"}, DependsOn: []string{"a"}}, {ID: "c", Files: []string{"c"}, DependsOn: []string{"b"}}}
+	levels, err := topoLevels(chain)
+	if err != nil || len(levels) != 3 {
+		t.Fatalf("chain: %v %v", levels, err)
+	}
+	diamond := []packet{
+		{ID: "a", Files: []string{"a"}},
+		{ID: "b", Files: []string{"b"}, DependsOn: []string{"a"}},
+		{ID: "c", Files: []string{"c"}, DependsOn: []string{"a"}},
+		{ID: "d", Files: []string{"d"}, DependsOn: []string{"b", "c"}},
+	}
+	levels, err = topoLevels(diamond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(levels[0], []string{"a"}) || !equalStrings(levels[1], []string{"b", "c"}) || !equalStrings(levels[2], []string{"d"}) {
+		t.Errorf("diamond levels: %v", levels)
+	}
+	cyc := []packet{{ID: "a", Files: []string{"a"}, DependsOn: []string{"b"}}, {ID: "b", Files: []string{"b"}, DependsOn: []string{"a"}}}
+	if _, err := topoLevels(cyc); err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "a") {
+		t.Errorf("cycle should error naming members: %v", err)
+	}
+	self := []packet{{ID: "a", Files: []string{"a"}, DependsOn: []string{"a"}}}
+	if _, err := topoLevels(self); err == nil {
+		t.Error("self-dependency should be a cycle")
+	}
+}
+
+func TestParsePackets(t *testing.T) {
+	good := "```packets\n- id: types\n  title: Types\n  files: a.go\n  dependsOn:\n  notes: only types\n- id: store\n  title: Store\n  files: b.go, b_test.go\n  dependsOn: types\n```"
+	ps, err := parsePackets(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 2 || ps[0].ID != "types" || !equalStrings(ps[1].Files, []string{"b.go", "b_test.go"}) || !equalStrings(ps[1].DependsOn, []string{"types"}) {
+		t.Errorf("parsed wrong: %+v", ps)
+	}
+	if _, err := parsePackets("no block"); err == nil {
+		t.Error("missing block should error")
+	}
+	if _, err := parsePackets("```packets\n- id:\n  files: a.go\n```"); err == nil {
+		t.Error("empty id should error")
+	}
+	if _, err := parsePackets("```packets\n- id: x\n  title: X\n```"); err == nil {
+		t.Error("empty files should error")
+	}
+	if _, err := parsePackets("```packets\n- id: x\n  files: a.go\n- id: x\n  files: b.go\n```"); err == nil {
+		t.Error("duplicate id should error")
+	}
+}
+
+func TestValidatePackets(t *testing.T) {
+	if err := validatePackets([]packet{{ID: "a", Files: []string{"a.go"}, DependsOn: []string{"missing"}}}); err == nil {
+		t.Error("unknown dep should error")
+	}
+	if err := validatePackets([]packet{{ID: "a", Files: []string{"x.go"}}, {ID: "b", Files: []string{"x.go"}}}); err == nil {
+		t.Error("shared file should error")
+	}
+	if err := validatePackets([]packet{{ID: "a", Files: []string{"../escape.go"}}}); err == nil {
+		t.Error("unsafe path should error")
+	}
+	var nine []packet
+	for i := 0; i < 9; i++ {
+		nine = append(nine, packet{ID: fmt.Sprintf("p%d", i), Files: []string{fmt.Sprintf("f%d.go", i)}})
+	}
+	if err := validatePackets(nine); err == nil {
+		t.Error("9 packets should exceed maxPackets")
+	}
+}
+
+func TestShouldSwarm(t *testing.T) {
+	big := "## Changes by area\n| Area/Path | Change |\n|---|---|\n| a.go | new |\n| b.go | new |\n| c/d.go | new |\n| e.go | mod |\n"
+	if !shouldSwarm(big) {
+		t.Errorf("4 paths should swarm: count=%d", countDesignPaths(big))
+	}
+	small := "## Changes by area\n| Area/Path | Change |\n|---|---|\n| a.go | new |\n"
+	if shouldSwarm(small) {
+		t.Errorf("too few paths should not swarm: count=%d", countDesignPaths(small))
+	}
+	if shouldSwarm("## Summary\nno table here") {
+		t.Error("missing section should not swarm")
+	}
+}
+
+func TestRunSwarmScheduling(t *testing.T) {
+	root := t.TempDir()
+	ps := []packet{
+		{ID: "types", Files: []string{"types.go"}},
+		{ID: "store", Files: []string{"store.go"}, DependsOn: []string{"types"}},
+		{ID: "http", Files: []string{"http.go"}, DependsOn: []string{"types"}},
+	}
+	sp := &swarmProvider{respond: func(id string) (string, error) {
+		switch id {
+		case "types":
+			return fileBlock("types.go", "package main\ntype T int"), nil
+		case "store":
+			return fileBlock("store.go", "package main\nfunc S(){}"), nil
+		case "http":
+			return fileBlock("http.go", "package main\nfunc H(){}"), nil
+		}
+		return "", nil
+	}}
+	s := swarmSession(root, sp)
+	merged, _, err := runSwarm(context.Background(), s.orch, s, "design", ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp.log[0] != "types" {
+		t.Errorf("types must build first: %v", sp.log)
+	}
+	if !contains(sp.log[1:], "store") || !contains(sp.log[1:], "http") {
+		t.Errorf("store+http must build in wave 2: %v", sp.log)
+	}
+	if len(merged) != 3 {
+		t.Errorf("want 3 merged files, got %d", len(merged))
+	}
+	if !strings.Contains(sp.userByID["store"], "STUBS FROM COMPLETED PACKETS") || !strings.Contains(sp.userByID["store"], "packet types") {
+		t.Errorf("store should receive types' stubs:\n%s", sp.userByID["store"])
+	}
+}
+
+func TestRunSwarmFailureSkips(t *testing.T) {
+	root := t.TempDir()
+	ps := []packet{
+		{ID: "types", Files: []string{"types.go"}},
+		{ID: "store", Files: []string{"store.go"}, DependsOn: []string{"types"}},
+		{ID: "wire", Files: []string{"wire.go"}, DependsOn: []string{"store"}},
+	}
+	sp := &swarmProvider{respond: func(id string) (string, error) {
+		switch id {
+		case "types":
+			return fileBlock("types.go", "package main\ntype T int"), nil
+		case "store":
+			return "", errors.New("store boom")
+		case "wire":
+			return fileBlock("wire.go", "package main"), nil
+		}
+		return "", nil
+	}}
+	s := swarmSession(root, sp)
+	merged, results, err := runSwarm(context.Background(), s.orch, s, "design", ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]packetResult{}
+	for _, r := range results {
+		byID[r.pkt.ID] = r
+	}
+	if byID["store"].err == nil {
+		t.Error("store should be failed")
+	}
+	if !byID["wire"].skipped {
+		t.Errorf("wire should be skipped (dep store failed): %+v", byID["wire"])
+	}
+	if byID["types"].err != nil {
+		t.Error("types should still succeed")
+	}
+	if len(merged) != 1 {
+		t.Errorf("only types should merge, got %d files", len(merged))
+	}
+}
+
+func TestRunSwarmCtxCancel(t *testing.T) {
+	root := t.TempDir()
+	ps := []packet{{ID: "a", Files: []string{"a.go"}}}
+	sp := &swarmProvider{respond: func(id string) (string, error) { return fileBlock("a.go", "x"), nil }}
+	s := swarmSession(root, sp)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := runSwarm(ctx, s.orch, s, "d", ps); err == nil {
+		t.Error("cancelled ctx should return an error and apply nothing")
+	}
+}
+
+func TestBuilderOutputFiltered(t *testing.T) {
+	pkt := packet{ID: "x", Files: []string{"a.go"}}
+	out := filterToPacket(pkt, []fileChange{{path: "a.go", content: "ok"}, {path: "b.go", content: "nope"}})
+	if len(out) != 1 || out[0].path != "a.go" {
+		t.Errorf("out-of-scope file should be dropped: %+v", out)
+	}
+}
+
+func TestMergeDisjoint(t *testing.T) {
+	base := "l1\nl2\nl3\nl4\nl5\n"
+	a := "TOP\nl2\nl3\nl4\nl5\n"    // edits line 1
+	b := "l1\nl2\nl3\nl4\nBOTTOM\n" // edits line 5
+	m, ok := mergeDisjoint(base, a, b)
+	if !ok || !strings.Contains(m, "TOP") || !strings.Contains(m, "BOTTOM") {
+		t.Errorf("disjoint edits should union: ok=%v m=%q", ok, m)
+	}
+	if _, ok := mergeDisjoint(base, "l1\nXX\nl3\nl4\nl5\n", "l1\nYY\nl3\nl4\nl5\n"); ok {
+		t.Error("edits to the same line should not be disjoint")
+	}
+	if _, ok := mergeDisjoint(base, "l1\nl2\nAA\nl3\nl4\nl5\n", "l1\nl2\nBB\nl3\nl4\nl5\n"); ok {
+		t.Error("insertions at the same index should not be disjoint")
+	}
+	big := strings.Repeat("x\n", maxDiffLines+1)
+	if _, ok := mergeDisjoint(big, big, big); ok {
+		t.Error("oversized input should decline")
+	}
+}
+
+func TestMergeOutputsDependencyWins(t *testing.T) {
+	root := t.TempDir()
+	ps := []packet{{ID: "b", Files: []string{"x.go"}}, {ID: "a", Files: []string{"y.go"}, DependsOn: []string{"b"}}}
+	results := []packetResult{
+		{pkt: ps[0], changes: []fileChange{{path: "shared.go", content: "B version"}}},
+		{pkt: ps[1], changes: []fileChange{{path: "shared.go", content: "A version"}}},
+	}
+	arbCalled := false
+	arb := func(path, base, a, b string) (string, error) { arbCalled = true; return "", nil }
+	merged, err := mergeOutputs(root, results, ps, arb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arbCalled {
+		t.Error("arbitration must not run when dependency order decides")
+	}
+	if len(merged) != 1 || merged[0].content != "A version" {
+		t.Errorf("dependent a's version should win: %+v", merged)
+	}
+}
+
+func TestMergeOutputsArbitration(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "shared.go"), []byte("line1\nline2\nline3\n"), 0o644)
+	ps := []packet{{ID: "a", Files: []string{"a.go"}}, {ID: "b", Files: []string{"b.go"}}}
+	results := []packetResult{
+		{pkt: ps[0], changes: []fileChange{{path: "shared.go", content: "line1\nAAA\nline3\n"}}},
+		{pkt: ps[1], changes: []fileChange{{path: "shared.go", content: "line1\nBBB\nline3\n"}}},
+	}
+	arbCalls := 0
+	var gotBase, gotA, gotB string
+	arb := func(path, base, a, b string) (string, error) {
+		arbCalls++
+		gotBase, gotA, gotB = base, a, b
+		return "MERGED", nil
+	}
+	merged, err := mergeOutputs(root, results, ps, arb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arbCalls != 1 {
+		t.Errorf("arbitration should run exactly once, ran %d", arbCalls)
+	}
+	if !strings.Contains(gotBase, "line2") || !strings.Contains(gotA, "AAA") || !strings.Contains(gotB, "BBB") {
+		t.Error("arbitration should receive base + both versions")
+	}
+	if merged[0].content != "MERGED" {
+		t.Errorf("arbitration output should be used: %q", merged[0].content)
+	}
+}
+
+func TestDetectToolchain(t *testing.T) {
+	mk := func(files map[string]string) string {
+		d := t.TempDir()
+		for name, body := range files {
+			os.WriteFile(filepath.Join(d, name), []byte(body), 0o644)
+		}
+		return d
+	}
+	if tc, ok := detectToolchain(mk(map[string]string{"go.mod": "module x"})); !ok || tc.name != "go" || len(tc.cmds) != 2 {
+		t.Errorf("go.mod → go build+vet, got %+v ok=%v", tc, ok)
+	}
+	if tc, ok := detectToolchain(mk(map[string]string{"package.json": `{"scripts":{"test":"jest"}}`})); !ok || tc.name != "npm" {
+		t.Errorf("real npm test → npm, got %+v ok=%v", tc, ok)
+	}
+	if _, ok := detectToolchain(mk(map[string]string{"package.json": `{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}`})); ok {
+		t.Error("npm default test should not match")
+	}
+	if tc, ok := detectToolchain(mk(map[string]string{"Cargo.toml": "[package]"})); !ok || tc.name != "cargo" {
+		t.Errorf("Cargo.toml → cargo, got %+v", tc)
+	}
+	if tc, ok := detectToolchain(mk(map[string]string{"Makefile": "build:\n\tgo build\ntest:\n\tgo test\n"})); !ok || tc.name != "make" {
+		t.Errorf("Makefile test target → make, got %+v", tc)
+	}
+	if _, ok := detectToolchain(mk(map[string]string{})); ok {
+		t.Error("empty dir → no toolchain")
+	}
+	if tc, _ := detectToolchain(mk(map[string]string{"go.mod": "module x", "Makefile": "test:\n\tx\n"})); tc.name != "go" {
+		t.Error("go should win over make")
+	}
+}
+
+func TestTruncateOutput(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&b, "line%d\n", i)
+	}
+	out := truncateOutput(b.String(), 80, 40)
+	if !strings.Contains(out, "line0") || !strings.Contains(out, "line299") {
+		t.Error("should keep first and last lines")
+	}
+	if !strings.Contains(out, "omitted") {
+		t.Error("should note omitted lines")
+	}
+	if got := truncateOutput("a\nb\nc", 80, 40); got != "a\nb\nc" {
+		t.Errorf("short text unchanged: %q", got)
+	}
+}
+
+func TestMapErrorsToFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []string{"a.go", "b.go"} {
+		os.WriteFile(filepath.Join(root, f), []byte("x"), 0o644)
+	}
+	out := "a.go:41:15: undefined: X\nb.go:10: oops\na.go:9: again\nmissing.go:1: nope\n/etc/passwd:1: bad\n../x.go:2: bad\n"
+	files := mapErrorsToFiles(out, root)
+	if !equalStrings(files, []string{"a.go", "b.go"}) {
+		t.Errorf("expected [a.go b.go] deduped, got %v", files)
+	}
+}
+
+func TestManifestV2RoundTrip(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "over.go"), []byte("orig"), 0o644)
+	run := newBackupRun(root, time.Now())
+	run.save("over.go")
+	run.markCreated("new.go")
+	run.finish()
+	data, err := os.ReadFile(filepath.Join(run.dir, "manifest.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), "#v2\n") {
+		t.Errorf("manifest should start with #v2: %q", data)
+	}
+	restore, created := parseManifest(data)
+	if !equalStrings(restore, []string{"over.go"}) || !equalStrings(created, []string{"new.go"}) {
+		t.Errorf("parsed: restore=%v created=%v", restore, created)
+	}
+	// v1 compatibility
+	r1, c1 := parseManifest([]byte("old/a.go\nold/b.go\n"))
+	if !equalStrings(r1, []string{"old/a.go", "old/b.go"}) || len(c1) != 0 {
+		t.Errorf("v1 parse: %v %v", r1, c1)
+	}
+}
+
+func TestApplyChangesRecordsCreated(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "exist.go"), []byte("old\n"), 0o644)
+	changes := []fileChange{
+		{path: "exist.go", content: "new content\n"},
+		{path: "fresh.go", content: "brand new\n"},
+	}
+	applied, stamp, err := applyChanges(root, changes, true)
+	if err != nil || !applied || stamp == "" {
+		t.Fatalf("applied=%v stamp=%q err=%v", applied, stamp, err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".archi", "backups", stamp, "manifest.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, created := parseManifest(data)
+	if !equalStrings(restore, []string{"exist.go"}) {
+		t.Errorf("overwritten should be B: %v", restore)
+	}
+	if !equalStrings(created, []string{"fresh.go"}) {
+		t.Errorf("new should be C: %v", created)
+	}
+}
+
+func TestRollbackRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "keep.go"), []byte("ORIGINAL\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "gone.go"), []byte("DELETE ME\n"), 0o644)
+	changes := []fileChange{
+		{path: "keep.go", content: "MODIFIED\n"},
+		{path: "made.go", content: "CREATED\n"},
+		{path: "gone.go", del: true},
+	}
+	_, stamp, err := applyChanges(root, changes, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDir := filepath.Join(root, ".archi", "backups", stamp)
+	data, _ := os.ReadFile(filepath.Join(runDir, "manifest.txt"))
+	restore, created := parseManifest(data)
+	if err := restoreRun(root, runDir, restore, created); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "keep.go")); string(b) != "ORIGINAL\n" {
+		t.Errorf("overwritten file not restored: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(root, "made.go")); !os.IsNotExist(err) {
+		t.Error("created file should be deleted on rollback")
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "gone.go")); string(b) != "DELETE ME\n" {
+		t.Errorf("deleted file not restored: %q", b)
+	}
+}
+
+func TestListBackupRuns(t *testing.T) {
+	dir := t.TempDir()
+	for _, stamp := range []string{"20260101-000000", "20260102-000000"} {
+		os.MkdirAll(filepath.Join(dir, stamp), 0o755)
+		os.WriteFile(filepath.Join(dir, stamp, "manifest.txt"), []byte("#v2\nB\ta.go\nC\tb.go\n"), 0o644)
+	}
+	os.MkdirAll(filepath.Join(dir, "20260103-000000"), 0o755)
+	os.WriteFile(filepath.Join(dir, "20260103-000000", "manifest.txt"), []byte("legacy.go\n"), 0o644)
+	runs := listBackupRuns(dir)
+	if len(runs) != 3 {
+		t.Fatalf("want 3 runs, got %d", len(runs))
+	}
+	if runs[0].stamp != "20260103-000000" {
+		t.Errorf("newest first: %v", runs[0].stamp)
+	}
+	if runs[0].restored != 1 || runs[0].created != 0 {
+		t.Errorf("v1 counts: %+v", runs[0])
+	}
+	if runs[1].restored != 1 || runs[1].created != 1 {
+		t.Errorf("v2 counts: %+v", runs[1])
+	}
+}

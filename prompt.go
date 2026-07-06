@@ -257,3 +257,127 @@ func buildUserMessage(design, profileMD, mapMD string) string {
 		"\n\n=== FILE MAP ===\n\n" + mapMD +
 		"\n\nGenerate the code now, in the required file-block format only."
 }
+
+const plannerPrompt = `You are a technical lead splitting an APPROVED design into work packets for
+parallel implementation. You are given the design, the codebase profile, and the
+file map. Produce 2 to 8 packets. Each packet is a coherent unit one engineer could
+implement alone: interfaces/types first, then implementations, then wiring and tests.
+Packets must not share files. Dependencies must form a DAG — no cycles. Prefer fewer,
+larger packets over many tiny ones.
+
+Output ONLY one fenced block in EXACTLY this format, no prose before or after:
+
+` + "```packets\n" + `- id: <short-slug>
+  title: <one line>
+  files: <comma-separated relative paths this packet creates or modifies>
+  dependsOn: <comma-separated packet ids, or leave empty>
+  notes: <one or two lines of guidance for the builder>
+- id: <next packet>
+` + "```" + `
+
+Rules: ids are lowercase slugs, unique within the plan. Every dependsOn id must name
+another packet in this plan. Use real paths from the map; new files go where the
+design says. If the change is too small to split, output a single packet.`
+
+const packetBuildPrompt = `You are a senior engineer implementing ONE work packet of an approved design in a
+specific codebase. You are given the full design, your packet, the current contents
+of the files your packet touches, and interface stubs from packets already completed.
+Implement ONLY your packet. Do not touch files outside your packet's file list. Match
+the codebase's existing conventions, style, and structure. Code against the provided
+stubs exactly — never re-declare a symbol a stub defines.
+
+Output ONLY file blocks — no prose before, between, or after. For each file to create
+or replace, output its FULL contents:
+
+=== FILE: relative/path/from/repo/root ===
+` + "```language\n" + `<complete file contents>
+` + "```" + `
+
+To delete a file, output a single line:
+
+=== DELETE: relative/path ===
+
+Rules: full file contents (never diffs or ellipses). Only paths from your packet's
+file list.`
+
+const arbitratePrompt = `You are an integrator reconciling two generated versions of the SAME file, produced
+by two work packets of one approved design. You are given the file's current content
+on disk and both generated versions labeled with the packet that produced each.
+Produce ONE merged file that preserves the intent of both packets and compiles. Where
+the versions genuinely conflict, keep the behavior the design calls for and note the
+discarded intent in a one-line code comment.
+
+Output ONLY one file block, no prose:
+
+=== FILE: <the path> ===
+` + "```language\n" + `<complete merged file contents>
+` + "```"
+
+const repairPrompt = `You are a senior engineer fixing a build or test failure just introduced by generated
+code. You are given the design summary, the failing command and its output, and the
+current contents of the implicated files. Make the SMALLEST change that fixes the
+failure without abandoning the design's intent. Do not refactor, rename, or improve
+anything beyond the fix. If the true fix belongs in a file you were not given, output
+that file's corrected FULL contents anyway, using its real path.
+
+Output ONLY file blocks in the required format — full file contents, no prose:
+
+=== FILE: relative/path ===
+` + "```language\n" + `<complete file contents>
+` + "```"
+
+// plannerUserMessage assembles the planning request.
+func plannerUserMessage(design, profileMD, mapMD string) string {
+	return "=== APPROVED DESIGN ===\n\n" + design +
+		"\n\n=== CODEBASE PROFILE ===\n\n" + profileMD +
+		"\n\n=== FILE MAP ===\n\n" + mapMD +
+		"\n\nProduce the work packets now, in the required fenced format only."
+}
+
+// packetUserMessage assembles one builder's request: design, its packet, the
+// current contents of touched files, and stubs from completed packets.
+func packetUserMessage(design string, pkt packet, files []seedFile, stubs string) string {
+	var b strings.Builder
+	b.WriteString("=== APPROVED DESIGN ===\n\n" + design + "\n\n")
+	b.WriteString("=== YOUR PACKET ===\n")
+	b.WriteString("id: " + pkt.ID + "\n")
+	b.WriteString("title: " + pkt.Title + "\n")
+	b.WriteString("files: " + strings.Join(pkt.Files, ", ") + "\n")
+	if pkt.Notes != "" {
+		b.WriteString("notes: " + pkt.Notes + "\n")
+	}
+	b.WriteString("\n=== CURRENT FILE CONTENTS ===\n")
+	have := map[string]bool{}
+	for _, f := range files {
+		have[f.rel] = true
+	}
+	b.WriteString(fenceFiles(files))
+	for _, f := range pkt.Files {
+		if rel, ok := safeRel(f); ok && !have[rel] {
+			b.WriteString("\n--- " + rel + " (new file) ---\n")
+		}
+	}
+	if stubs != "" {
+		b.WriteString("\n=== STUBS FROM COMPLETED PACKETS ===\n" + stubs)
+	}
+	b.WriteString("\n\nImplement your packet now, in the required file-block format only.")
+	return b.String()
+}
+
+// arbitrateUserMessage assembles the two-version merge request.
+func arbitrateUserMessage(path, base, a, b, pktA, pktB string) string {
+	return "=== FILE ===\n" + path +
+		"\n\n=== CURRENT ON DISK ===\n```\n" + base + "\n```\n" +
+		"\n=== VERSION FROM " + pktA + " ===\n```\n" + a + "\n```\n" +
+		"\n=== VERSION FROM " + pktB + " ===\n```\n" + b + "\n```\n" +
+		"\n\nOutput the single merged file now."
+}
+
+// repairUserMessage assembles the repair request from a failing verification.
+func repairUserMessage(designSummary, cmd, output string, files []seedFile) string {
+	return "=== DESIGN (summary) ===\n\n" + designSummary +
+		"\n\n=== FAILING COMMAND ===\n" + cmd +
+		"\n\n=== OUTPUT ===\n" + output +
+		"\n\n=== IMPLICATED FILES ===\n" + fenceFiles(files) +
+		"\n\nOutput the minimal fix now, file blocks only."
+}

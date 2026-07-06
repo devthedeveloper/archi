@@ -37,10 +37,10 @@ func safeRel(p string) (string, bool) {
 // file it overwrites or deletes into a timestamped run directory under
 // .archi/backups/, and writes them. Paths that escape the repo root are
 // refused.
-func applyChanges(root string, changes []fileChange, autoYes bool) error {
+func applyChanges(root string, changes []fileChange, autoYes bool) (applied bool, stamp string, err error) {
 	if len(changes) == 0 {
 		warn("The model returned no file changes.")
-		return nil
+		return false, "", nil
 	}
 
 	os.Stderr.WriteString("\n")
@@ -68,7 +68,7 @@ func applyChanges(root string, changes []fileChange, autoYes bool) error {
 		}
 	}
 	if len(valid) == 0 {
-		return nil
+		return false, "", nil
 	}
 
 	if gitDirty(root) {
@@ -76,7 +76,7 @@ func applyChanges(root string, changes []fileChange, autoYes bool) error {
 	}
 	if !autoYes && !confirm("Write these "+humanCount(len(valid))+" changes?") {
 		warn("Aborted — nothing written.")
-		return nil
+		return false, "", nil
 	}
 
 	run := newBackupRun(root, time.Now())
@@ -86,28 +86,34 @@ func applyChanges(root string, changes []fileChange, autoYes bool) error {
 		if c.del {
 			run.save(c.path)
 			if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-				return err
+				return false, "", err
 			}
+			written++
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return err
+			return false, "", err
 		}
-		if _, err := os.Stat(full); err == nil {
+		if _, statErr := os.Stat(full); statErr == nil {
 			run.save(c.path)
+		} else {
+			run.markCreated(c.path)
 		}
 		if err := os.WriteFile(full, []byte(ensureTrailingNewline(c.content)), 0o644); err != nil {
-			return err
+			return false, "", err
 		}
 		written++
 	}
 	run.finish()
+	if len(run.files)+len(run.created) > 0 {
+		stamp = filepath.Base(run.dir)
+	}
 	msg := fmt.Sprintf("Wrote %d files", written)
 	if len(run.files) > 0 {
 		msg += dim("  · originals backed up to " + run.dir)
 	}
 	ok(msg)
-	return nil
+	return true, stamp, nil
 }
 
 // printDiff writes a unified diff to stderr, indented and colored (additions
@@ -157,10 +163,14 @@ func gitDirty(root string) bool {
 // .archi/backups/<timestamp>/, preserving each file's relative path. All of
 // it is best-effort: backups never block the apply itself.
 type backupRun struct {
-	root  string
-	dir   string
-	files []string
+	root    string
+	dir     string
+	files   []string // backed-up originals (overwritten or deleted)
+	created []string // files this run created (no backup; rollback deletes them)
 }
+
+// markCreated records that rel was created by this run (it did not exist before).
+func (b *backupRun) markCreated(rel string) { b.created = append(b.created, rel) }
 
 // newBackupRun names (but does not yet create) the backup directory for an
 // apply run starting at t.
@@ -189,13 +199,23 @@ func (b *backupRun) save(rel string) {
 	b.files = append(b.files, rel)
 }
 
-// finish writes the run's manifest.txt and prunes old backup runs. It is a
-// no-op when nothing was backed up.
+// finish writes the run's v2 manifest and prunes old backup runs. It is a
+// no-op when the run neither backed up nor created anything.
 func (b *backupRun) finish() {
-	if len(b.files) == 0 {
+	if len(b.files)+len(b.created) == 0 {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(b.dir, "manifest.txt"), []byte(strings.Join(b.files, "\n")+"\n"), 0o644)
+	var sb strings.Builder
+	sb.WriteString("#v2\n")
+	for _, rel := range b.files {
+		sb.WriteString("B\t" + rel + "\n")
+	}
+	for _, rel := range b.created {
+		sb.WriteString("C\t" + rel + "\n")
+	}
+	if err := os.MkdirAll(b.dir, 0o755); err == nil {
+		_ = os.WriteFile(filepath.Join(b.dir, "manifest.txt"), []byte(sb.String()), 0o644)
+	}
 	pruneBackups(filepath.Dir(b.dir), maxBackupRuns)
 }
 

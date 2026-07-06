@@ -11,7 +11,7 @@ import (
 
 // version is the release version; goreleaser overrides it at build time via
 // -ldflags "-X main.version=...".
-var version = "1.4.0"
+var version = "1.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -25,6 +25,8 @@ func main() {
 		cmdDesign(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "rollback":
+		cmdRollback(os.Args[2:])
 	case "version", "-version", "--version", "-v":
 		fmt.Println("archi", version)
 	case "help", "-h", "--help":
@@ -46,6 +48,7 @@ func printHelp() {
     `+cyan("init")+`   [path]        Learn a codebase — scan it and cache an understanding
     `+cyan("design")+` "<request>"   Design a change, grounded in the learned codebase
     `+cyan("status")+`               Show what archi has learned about this repo
+    `+cyan("rollback")+`             Restore the files a build run overwrote or created
     `+cyan("version")+`              Print the version
 
   `+bold("QUICK START")+`
@@ -109,5 +112,8 @@ func designUsage() {
   -agents string     ensemble mode: full (explorer + critics), fast (single call), off (reserved)
   -critic-model string  cheaper model for the critic panel (default: the design model)
   -rounds int        designer-critic debate rounds, 1-3 (default 1)
+  -swarm string      split the build into parallel packets: on|off (default: on with -agents full)
+  -verify string     run the repo's toolchain after applying: on|off (default on)
+  -max-repair int    max verify/repair iterations (default 3)
 `)
 }

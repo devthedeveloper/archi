@@ -185,6 +185,31 @@ func (o *Orchestrator) RunParallel(ctx context.Context, calls []AgentCall) []Age
 	return results
 }
 
+// RunPool runs calls in a bounded worker pool WITHOUT cancel-on-error: each
+// call fails independently. Used by the critic panel and the build swarm, where
+// one agent failing must not cancel the others. Only ctx cancellation aborts.
+// Results preserve call order.
+func (o *Orchestrator) RunPool(ctx context.Context, calls []AgentCall) []AgentResult {
+	n := o.Concurrency
+	if n <= 0 {
+		n = defaultAgentConcurrency
+	}
+	results := make([]AgentResult, len(calls))
+	sem := make(chan struct{}, n)
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		wg.Add(1)
+		go func(i int, c AgentCall) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = o.Run(ctx, c.Agent, c.Input)
+		}(i, c)
+	}
+	wg.Wait()
+	return results
+}
+
 // costLine renders the end-of-run summary, "" when no calls ran.
 func (o *Orchestrator) costLine() string {
 	o.mu.Lock()
