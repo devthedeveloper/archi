@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1121,5 +1125,499 @@ func TestDesignHistoryRoundTrip(t *testing.T) {
 	}
 	if recs[0].built {
 		t.Errorf("other design should stay unbuilt: %+v", recs)
+	}
+}
+
+// ── Phase 1: agent runtime ──────────────────────────────────────────────────
+
+// fakeProvider scripts Complete for orchestrator tests: fixed output or error,
+// optional delay honoring ctx, records prompts and the max observed concurrency.
+type fakeProvider struct {
+	out                   string
+	err                   error
+	delay                 time.Duration
+	mu                    sync.Mutex
+	calls                 int
+	gotSystem, gotUser    []string
+	inFlight, maxInFlight int
+}
+
+func (f *fakeProvider) Name() string  { return "fake/fake-1" }
+func (f *fakeProvider) Model() string { return "fake-1" }
+
+func (f *fakeProvider) Complete(ctx context.Context, system, user string, progress io.Writer) (string, error) {
+	f.mu.Lock()
+	f.calls++
+	f.gotSystem = append(f.gotSystem, system)
+	f.gotUser = append(f.gotUser, user)
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+	defer func() { f.mu.Lock(); f.inFlight--; f.mu.Unlock() }()
+
+	if err := sleepCtx(ctx, f.delay); err != nil {
+		return "", err
+	}
+	if progress != nil && f.out != "" {
+		mid := len(f.out) / 2
+		progress.Write([]byte(f.out[:mid]))
+		progress.Write([]byte(f.out[mid:]))
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return f.out, f.err
+}
+
+func traceInTempDir(t *testing.T) *Trace {
+	t.Helper()
+	tr, err := newTrace(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tr
+}
+
+func readTraceLines(t *testing.T, dir string) []traceEvent {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "trace.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []traceEvent
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if ln == "" {
+			continue
+		}
+		var ev traceEvent
+		if err := json.Unmarshal([]byte(ln), &ev); err != nil {
+			t.Fatalf("bad json line %q: %v", ln, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestSpecFor(t *testing.T) {
+	d, ok := specFor(RoleDesigner)
+	if !ok || d.System != architectPrompt {
+		t.Errorf("designer spec wrong: ok=%v system==architectPrompt=%v", ok, d.System == architectPrompt)
+	}
+	b, ok := specFor(RoleBuilder)
+	if !ok || b.System != buildPrompt {
+		t.Errorf("builder spec wrong: ok=%v", ok)
+	}
+	if _, ok := specFor(RoleReviewer); ok {
+		t.Error("reviewer should not be registered in Phase 1")
+	}
+}
+
+func TestRenderSystem(t *testing.T) {
+	out, err := renderSystem(AgentSpec{Role: RoleDesigner, System: architectPrompt}, TaskInput{})
+	if err != nil || out != architectPrompt {
+		t.Errorf("no-action prompt must pass through byte-identically (err=%v, equal=%v)", err, out == architectPrompt)
+	}
+	out, err = renderSystem(AgentSpec{Role: "t", System: "hi {{.Request}}"}, TaskInput{Request: "world"})
+	if err != nil || out != "hi world" {
+		t.Errorf("substitution failed: %q err=%v", out, err)
+	}
+	if out, err := renderSystem(AgentSpec{Role: "t", System: "{{.Nope"}, TaskInput{}); err == nil || out != "" {
+		t.Errorf("bad template should error with empty string, got %q err=%v", out, err)
+	}
+}
+
+func TestAgentUserMessage(t *testing.T) {
+	if got := agentUserMessage(TaskInput{Request: "r", Extra: map[string]string{"user_message": "VERBATIM"}}); got != "VERBATIM" {
+		t.Errorf("escape hatch not verbatim: %q", got)
+	}
+	got := agentUserMessage(TaskInput{
+		Request:   "do it",
+		Interview: "Q/A",
+		Grounding: []budgetPart{{name: "profile", content: "P"}, {name: "file map", content: "M"}},
+	})
+	for _, want := range []string{"=== PROFILE ===", "=== FILE MAP ===", "=== INTERVIEW ===", "=== REQUEST ===", "do it"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generic message missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, "PROFILE") > strings.Index(got, "INTERVIEW") {
+		t.Error("grounding must precede interview")
+	}
+	if strings.Index(got, "INTERVIEW") > strings.Index(got, "REQUEST") {
+		t.Error("interview must precede request")
+	}
+}
+
+func TestOrchestratorRun(t *testing.T) {
+	fp := &fakeProvider{out: "DESIGN OUTPUT"}
+	o := &Orchestrator{RunBudget: 0, Trace: nopTrace(), started: time.Now()}
+	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: architectPrompt}, P: fp}
+	res := o.Run(context.Background(), a, designTask("req", "USERMSG"))
+	if res.Role != RoleDesigner || res.Output != "DESIGN OUTPUT" {
+		t.Errorf("bad result: %+v", res)
+	}
+	if res.TokensIn == 0 || res.TokensOut == 0 || res.Duration < 0 {
+		t.Errorf("counters unset: %+v", res)
+	}
+	if o.calls != 1 || o.spent != res.TokensOut || o.tokensIn != res.TokensIn {
+		t.Errorf("orch counters wrong: calls=%d spent=%d in=%d", o.calls, o.spent, o.tokensIn)
+	}
+	if fp.gotSystem[0] != architectPrompt || fp.gotUser[0] != "USERMSG" {
+		t.Errorf("prompts modified before provider: sys==prompt=%v user=%q", fp.gotSystem[0] == architectPrompt, fp.gotUser[0])
+	}
+}
+
+func TestOrchestratorRunStream(t *testing.T) {
+	fp := &fakeProvider{out: "streamed-output-here"}
+	o := &Orchestrator{Trace: nopTrace(), started: time.Now()}
+	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: "sys"}, P: fp}
+
+	var live bytes.Buffer
+	if res := o.runStream(context.Background(), a, designTask("r", "u"), &live, nil); res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if live.String() != "streamed-output-here" {
+		t.Errorf("live writer got %q", live.String())
+	}
+
+	sp := startSpinner("x") // non-TTY: SetSuffix still records the suffix
+	o.runStream(context.Background(), a, designTask("r", "u"), nil, sp)
+	wantSuffix := fmt.Sprintf("~%s tokens", humanCount((len(fp.out)+3)/4))
+	if sp.suffix != wantSuffix {
+		t.Errorf("spinner suffix = %q, want %q (must match runModel format)", sp.suffix, wantSuffix)
+	}
+}
+
+func TestRunBudgetSkip(t *testing.T) {
+	fp := &fakeProvider{out: strings.Repeat("x", 600)} // ~150 tokens out
+	tr := traceInTempDir(t)
+	o := &Orchestrator{RunBudget: 100, Trace: tr, started: time.Now()}
+	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: "s"}, P: fp}
+
+	if r1 := o.Run(context.Background(), a, designTask("r", "u")); r1.Err != nil {
+		t.Fatalf("first call should succeed (overshoot allowed): %v", r1.Err)
+	}
+	r2 := o.Run(context.Background(), a, designTask("r", "u"))
+	if !errors.Is(r2.Err, errRunBudget) {
+		t.Errorf("second call should be budget-skipped, got %v", r2.Err)
+	}
+	if fp.calls != 1 {
+		t.Errorf("provider called %d times, want 1 (second never reaches it)", fp.calls)
+	}
+	lines := readTraceLines(t, tr.Dir())
+	if len(lines) != 2 {
+		t.Fatalf("want 2 trace events, got %d", len(lines))
+	}
+	if lines[1].Err == "" {
+		t.Error("skipped call's trace event should carry an err")
+	}
+}
+
+func TestRunBudgetUnlimited(t *testing.T) {
+	fp := &fakeProvider{out: strings.Repeat("y", 4000)}
+	o := &Orchestrator{RunBudget: 0, Trace: nopTrace(), started: time.Now()}
+	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: "s"}, P: fp}
+	for i := 0; i < 5; i++ {
+		if r := o.Run(context.Background(), a, designTask("r", "u")); r.Err != nil {
+			t.Fatalf("call %d errored under unlimited budget: %v", i, r.Err)
+		}
+	}
+	if fp.calls != 5 {
+		t.Errorf("want 5 calls, got %d", fp.calls)
+	}
+}
+
+func TestRunParallelOrder(t *testing.T) {
+	o := &Orchestrator{Concurrency: 3, Trace: nopTrace(), started: time.Now()}
+	var calls []AgentCall
+	for i := 0; i < 5; i++ {
+		fp := &fakeProvider{out: fmt.Sprintf("out-%d", i)}
+		calls = append(calls, AgentCall{
+			Agent: Agent{Spec: AgentSpec{Role: RoleDesigner, System: "s"}, P: fp},
+			Input: designTask("r", "u"),
+		})
+	}
+	res := o.RunParallel(context.Background(), calls)
+	for i := range res {
+		if res[i].Output != fmt.Sprintf("out-%d", i) {
+			t.Errorf("results[%d] = %q, want out-%d", i, res[i].Output, i)
+		}
+	}
+}
+
+func TestRunParallelBounds(t *testing.T) {
+	fp := &fakeProvider{out: "x", delay: 20 * time.Millisecond}
+	o := &Orchestrator{Concurrency: 2, Trace: nopTrace(), started: time.Now()}
+	var calls []AgentCall
+	for i := 0; i < 6; i++ {
+		calls = append(calls, AgentCall{
+			Agent: Agent{Spec: AgentSpec{Role: RoleDesigner, System: "s"}, P: fp},
+			Input: designTask("r", "u"),
+		})
+	}
+	o.RunParallel(context.Background(), calls)
+	fp.mu.Lock()
+	m, n := fp.maxInFlight, fp.calls
+	fp.mu.Unlock()
+	if m > 2 {
+		t.Errorf("maxInFlight = %d, want <= 2 (concurrency)", m)
+	}
+	if n != 6 {
+		t.Errorf("calls = %d, want 6", n)
+	}
+}
+
+func TestRunParallelFirstErrorCancels(t *testing.T) {
+	failFp := &fakeProvider{err: errors.New("boom")}
+	slowFp := &fakeProvider{out: "slow", delay: 2 * time.Second}
+	o := &Orchestrator{Concurrency: 3, Trace: nopTrace(), started: time.Now()}
+	calls := []AgentCall{
+		{Agent: Agent{Spec: AgentSpec{Role: RoleSecCritic, System: "s"}, P: failFp}, Input: designTask("r", "u")},
+		{Agent: Agent{Spec: AgentSpec{Role: RoleSimpCritic, System: "s"}, P: slowFp}, Input: designTask("r", "u")},
+		{Agent: Agent{Spec: AgentSpec{Role: RoleGrndCritic, System: "s"}, P: slowFp}, Input: designTask("r", "u")},
+	}
+	start := time.Now()
+	res := o.RunParallel(context.Background(), calls)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("siblings not cancelled promptly: took %s", elapsed)
+	}
+	cancelled := 0
+	for _, r := range res {
+		if errors.Is(r.Err, context.Canceled) {
+			cancelled++
+		}
+	}
+	if cancelled == 0 {
+		t.Error("expected at least one sibling cancelled by the first hard error")
+	}
+}
+
+func TestRunParallelBudgetSkipNoCancel(t *testing.T) {
+	// Pre-exhaust the run budget so every call is admission-skipped. Skips must
+	// return errRunBudget and must NOT cancel siblings (no context.Canceled) —
+	// only a non-budget hard error is allowed to cancel (see FirstErrorCancels).
+	fp := &fakeProvider{out: "unused"}
+	o := &Orchestrator{Concurrency: 3, RunBudget: 100, Trace: nopTrace(), started: time.Now()}
+	o.spent = 200 // already over budget before any call runs
+	var calls []AgentCall
+	for i := 0; i < 4; i++ {
+		calls = append(calls, AgentCall{
+			Agent: Agent{Spec: AgentSpec{Role: RoleDesigner, System: "s"}, P: fp},
+			Input: designTask("r", "u"),
+		})
+	}
+	res := o.RunParallel(context.Background(), calls)
+	for i, r := range res {
+		if !errors.Is(r.Err, errRunBudget) {
+			t.Errorf("call %d: err=%v, want errRunBudget", i, r.Err)
+		}
+		if errors.Is(r.Err, context.Canceled) {
+			t.Errorf("call %d was cancelled — a budget skip must never cancel siblings", i)
+		}
+	}
+	if fp.calls != 0 {
+		t.Errorf("provider called %d times, want 0 (all admission-skipped)", fp.calls)
+	}
+}
+
+func TestNewTraceAndRecord(t *testing.T) {
+	root := t.TempDir()
+	tr, err := newTrace(root, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.record(AgentResult{Role: RoleDesigner, Output: "FULL DESIGN", TokensIn: 100, TokensOut: 50, Duration: time.Second}, "glm-5.2:cloud")
+	tr.record(AgentResult{Role: RoleSecCritic, Output: "v", Verdict: &Verdict{Status: VerdictClean}, Err: errors.New("nope")}, "glm-5.2:cloud")
+
+	lines := readTraceLines(t, tr.Dir())
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d", len(lines))
+	}
+	if lines[0].Seq != 1 || lines[1].Seq != 2 {
+		t.Errorf("seqs = %d, %d", lines[0].Seq, lines[1].Seq)
+	}
+	if lines[0].Verdict != "" || lines[0].Err != "" {
+		t.Errorf("first line should omit verdict/err, got verdict=%q err=%q", lines[0].Verdict, lines[0].Err)
+	}
+	if lines[1].Verdict != "clean" || lines[1].Err != "nope" {
+		t.Errorf("second line verdict=%q err=%q", lines[1].Verdict, lines[1].Err)
+	}
+	data, err := os.ReadFile(filepath.Join(tr.Dir(), "01-designer.md"))
+	if err != nil || string(data) != "FULL DESIGN" {
+		t.Errorf("output file = %q err=%v", data, err)
+	}
+}
+
+func TestTraceRetention(t *testing.T) {
+	root := t.TempDir()
+	rd := runsDir(root)
+	if err := os.MkdirAll(rd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 25; i++ {
+		name := base.Add(time.Duration(i) * time.Minute).Format(stampLayout)
+		if err := os.MkdirAll(filepath.Join(rd, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	later := base.Add(100 * time.Minute)
+	if _, err := newTrace(root, later); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(rd)
+	if len(entries) != maxRuns {
+		t.Fatalf("want %d dirs, got %d", maxRuns, len(entries))
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name() == later.Format(stampLayout) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("newest run dir should be retained")
+	}
+}
+
+func TestTraceNop(t *testing.T) {
+	root := t.TempDir()
+	tr := nopTrace()
+	tr.record(AgentResult{Role: RoleDesigner, Output: "x"}, "m")
+	if tr.Dir() != "" {
+		t.Errorf("nop Dir() = %q, want empty", tr.Dir())
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 0 {
+		t.Errorf("nop trace created files: %v", entries)
+	}
+}
+
+func TestTraceConcurrentRecord(t *testing.T) {
+	tr := traceInTempDir(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tr.record(AgentResult{Role: RoleDesigner, Output: fmt.Sprintf("o%d", i)}, "m")
+		}(i)
+	}
+	wg.Wait()
+	lines := readTraceLines(t, tr.Dir())
+	if len(lines) != 20 {
+		t.Fatalf("want 20 lines, got %d", len(lines))
+	}
+	seen := map[int]bool{}
+	for _, l := range lines {
+		seen[l.Seq] = true
+	}
+	for i := 1; i <= 20; i++ {
+		if !seen[i] {
+			t.Errorf("missing seq %d", i)
+		}
+	}
+}
+
+func TestAgentConcurrencyEnv(t *testing.T) {
+	t.Setenv("ARCHI_AGENT_CONCURRENCY", "")
+	if agentConcurrency() != 3 {
+		t.Error("empty → 3")
+	}
+	t.Setenv("ARCHI_AGENT_CONCURRENCY", "5")
+	if agentConcurrency() != 5 {
+		t.Error("5 → 5")
+	}
+	for _, v := range []string{"0", "-1", "x"} {
+		t.Setenv("ARCHI_AGENT_CONCURRENCY", v)
+		if agentConcurrency() != 3 {
+			t.Errorf("%q → 3", v)
+		}
+	}
+}
+
+func TestRunTokensEnv(t *testing.T) {
+	t.Setenv("ARCHI_RUN_TOKENS", "")
+	if runTokenBudget() != 150000 {
+		t.Error("empty → 150000")
+	}
+	t.Setenv("ARCHI_RUN_TOKENS", "9000")
+	if runTokenBudget() != 9000 {
+		t.Error("9000 → 9000")
+	}
+	t.Setenv("ARCHI_RUN_TOKENS", "junk")
+	if runTokenBudget() != 150000 {
+		t.Error("junk → 150000")
+	}
+}
+
+func TestBoardLine(t *testing.T) {
+	// useColor is false under go test (non-TTY stderr), so markers/dim are identity.
+	mk := func(marker, role, state, suffix string) string {
+		return strings.TrimRight("  "+marker+" "+fmt.Sprintf("%-18s", role)+" "+fmt.Sprintf("%-8s", state)+" "+suffix, " ")
+	}
+	cases := []struct {
+		row   boardRow
+		frame int
+		want  string
+	}{
+		{boardRow{role: RoleDesigner, state: "waiting"}, 0, mk("◇", "designer", "waiting", "")},
+		{boardRow{role: RoleDesigner, state: "done", suffix: "~8.2k tokens · 41s"}, 0, mk("◆", "designer", "done", "~8.2k tokens · 41s")},
+		{boardRow{role: RoleSecCritic, state: "failed"}, 0, mk("✗", "sec-critic", "failed", "")},
+		{boardRow{role: RoleSimpCritic, state: "running"}, 2, mk(spinnerFrames[2], "simplicity-critic", "running", "")},
+	}
+	for _, c := range cases {
+		if got := boardLine(c.row, c.frame); got != c.want {
+			t.Errorf("boardLine(%s) = %q, want %q", c.row.state, got, c.want)
+		}
+	}
+}
+
+func TestBoardNilSafe(t *testing.T) {
+	var b *Board
+	b.Set(RoleDesigner, "running", "x")
+	b.Stop()
+}
+
+func TestCostLine(t *testing.T) {
+	o := &Orchestrator{Trace: nopTrace(), started: time.Now()}
+	if o.costLine() != "" {
+		t.Error("0 calls → empty line")
+	}
+	o.calls, o.tokensIn, o.spent = 2, 12000, 3400
+	line := o.costLine()
+	if !strings.Contains(line, "2 agent calls") {
+		t.Errorf("count wrong: %q", line)
+	}
+	if !strings.Contains(line, humanCount(12000)) || !strings.Contains(line, humanCount(3400)) {
+		t.Errorf("token counts missing: %q", line)
+	}
+	if strings.Contains(line, "trace ") {
+		t.Errorf("nop trace should add no trace path: %q", line)
+	}
+	o2 := &Orchestrator{Trace: traceInTempDir(t), started: time.Now()}
+	o2.calls = 1
+	l2 := o2.costLine()
+	if !strings.Contains(l2, "1 agent call ") {
+		t.Errorf("singular form wrong: %q", l2)
+	}
+	if !strings.Contains(l2, "trace ") {
+		t.Errorf("real trace should add its path: %q", l2)
+	}
+}
+
+func TestDesignPromptsUnchanged(t *testing.T) {
+	fp := &fakeProvider{out: "doc"}
+	o := &Orchestrator{Trace: nopTrace(), started: time.Now()}
+	userMsg := designUserMessage("PROFILE", "MAP", nil, "add X")
+	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: architectPrompt}, P: fp}
+	o.runStream(context.Background(), a, designTask("add X", userMsg), nil, nil)
+	if fp.gotSystem[0] != architectPrompt {
+		t.Error("system prompt was modified on the wire")
+	}
+	if fp.gotUser[0] != userMsg {
+		t.Errorf("user message modified on the wire:\n got %q\nwant %q", fp.gotUser[0], userMsg)
 	}
 }

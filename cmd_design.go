@@ -106,6 +106,7 @@ func cmdDesign(args []string) {
 		profile: profile, fileMap: fileMap, focus: fitFocus,
 		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
 	}
+	sess.orch = newOrchestrator(root)
 
 	interactive := stdoutTTY && isTTY(os.Stdin) && !*noInteractive && *out == ""
 	if interactive {
@@ -127,7 +128,36 @@ type session struct {
 	maxTokens   int
 	yes         bool
 	htmlFile    string
-	historyPath string // where this run's design history entry lives, "" if none
+	historyPath string        // where this run's design history entry lives, "" if none
+	orch        *Orchestrator // agent runtime: traces every call, charges the run budget
+}
+
+// agentFor binds a registered spec to the session's provider for that role
+// (designer budget for design-side calls, builder budget for build), with an
+// optional system-prompt override for the interview/answer sub-calls.
+func (s *session) agentFor(role AgentRole, systemOverride string) Agent {
+	spec, _ := specFor(role)
+	if systemOverride != "" {
+		spec.System = systemOverride
+	}
+	p := s.design()
+	if role == RoleBuilder {
+		p = s.builder()
+	}
+	return Agent{Spec: spec, P: p}
+}
+
+// designTask wraps a prebuilt user message in a TaskInput so the orchestrator
+// sends it byte-identically (the Phase 1 escape hatch).
+func designTask(request, userMessage string) TaskInput {
+	return TaskInput{Request: request, Extra: map[string]string{"user_message": userMessage}}
+}
+
+// printCost prints the orchestrator's end-of-run cost summary, if any calls ran.
+func (s *session) printCost() {
+	if line := s.orch.costLine(); line != "" {
+		info(line)
+	}
 }
 
 func (s *session) design() Provider { return s.mk(s.maxTokens) }
@@ -147,13 +177,14 @@ func (s *session) runInteractive(request string) {
 
 	// Phase 1 — clarify.
 	sp := startSpinner("Working out what to ask")
-	qraw, err := runModel(s.ctx, prov, clarifyPrompt, clarifyUserMessage(s.profile, s.fileMap, s.focus, request), nil, sp)
-	if err != nil {
+	res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, clarifyPrompt),
+		designTask(request, clarifyUserMessage(s.profile, s.fileMap, s.focus, request)), nil, sp)
+	if res.Err != nil {
 		sp.Abort()
-		failf("%v", err)
+		failf("%v", res.Err)
 	}
 	sp.Stop("Questions ready")
-	answers := askQuestions(parseQuestions(qraw))
+	answers := askQuestions(parseQuestions(res.Output))
 
 	req := request
 	if answers != "" {
@@ -163,10 +194,12 @@ func (s *session) runInteractive(request string) {
 	// Phase 2 — design (streamed live).
 	info("Designing …")
 	os.Stderr.WriteString("\n")
-	doc, err := runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, req), os.Stdout, nil)
-	if err != nil {
-		failf("%v", err)
+	res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
+		designTask(request, designUserMessage(s.profile, s.fileMap, s.focus, req)), os.Stdout, nil)
+	if res.Err != nil {
+		failf("%v", res.Err)
 	}
+	doc := res.Output
 	s.recordDesign(request, prov.Name(), doc)
 
 	// Phase 3 — review loop.
@@ -175,6 +208,7 @@ func (s *session) runInteractive(request string) {
 		case "a":
 			s.buildCode(doc)
 			s.maybeHTML(doc)
+			s.printCost()
 			return
 		case "m":
 			ch := readLine("what should change?")
@@ -183,9 +217,12 @@ func (s *session) runInteractive(request string) {
 			}
 			info("Revising …")
 			os.Stderr.WriteString("\n")
-			if doc, err = runModel(s.ctx, prov, architectPrompt, reviseUserMessage(doc, ch), os.Stdout, nil); err != nil {
-				failf("%v", err)
+			res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
+				designTask(request, reviseUserMessage(doc, ch)), os.Stdout, nil)
+			if res.Err != nil {
+				failf("%v", res.Err)
 			}
+			doc = res.Output
 			s.recordDesign(request, prov.Name(), doc)
 		case "q":
 			qq := readLine("your question:")
@@ -193,8 +230,10 @@ func (s *session) runInteractive(request string) {
 				continue
 			}
 			os.Stderr.WriteString("\n")
-			if _, err = runModel(s.ctx, prov, answerPrompt, questionUserMessage(doc, s.profile, qq), os.Stdout, nil); err != nil {
-				failf("%v", err)
+			res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, answerPrompt),
+				designTask(request, questionUserMessage(doc, s.profile, qq)), os.Stdout, nil)
+			if res.Err != nil {
+				failf("%v", res.Err)
 			}
 			os.Stderr.WriteString("\n")
 		case "w":
@@ -209,6 +248,7 @@ func (s *session) runInteractive(request string) {
 		case "x":
 			s.maybeHTML(doc)
 			ok("Done.")
+			s.printCost()
 			return
 		default:
 			warn("Pick a, m, q, w, or x.")
@@ -236,22 +276,24 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 	banner()
 	info("Designing with " + prov.Name())
 
+	task := designTask(request, designUserMessage(s.profile, s.fileMap, s.focus, request))
 	var doc string
-	var err error
 	if live {
 		os.Stderr.WriteString("\n")
-		doc, err = runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, request), os.Stdout, nil)
-		if err != nil {
-			failf("%v", err)
+		res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, os.Stdout, nil)
+		if res.Err != nil {
+			failf("%v", res.Err)
 		}
+		doc = res.Output
 	} else {
 		sp := startSpinner("Designing")
-		doc, err = runModel(s.ctx, prov, architectPrompt, designUserMessage(s.profile, s.fileMap, s.focus, request), nil, sp)
-		if err != nil {
+		res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, nil, sp)
+		if res.Err != nil {
 			sp.Abort()
-			failf("%v", err)
+			failf("%v", res.Err)
 		}
 		sp.Stop("Design ready")
+		doc = res.Output
 		if _, err := io.WriteString(target, doc); err != nil {
 			failf("%v", err)
 		}
@@ -264,6 +306,7 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 	if build {
 		s.buildCode(doc)
 	}
+	s.printCost()
 }
 
 // recordDesign saves (or refreshes) the design in .archi/designs. History is
@@ -290,14 +333,15 @@ func (s *session) buildCode(design string) {
 	info("Generating code with " + prov.Name())
 	os.Stderr.WriteString("\n")
 	cs := newCodeStream()
-	code, err := runModel(s.ctx, prov, buildPrompt, buildUserMessage(design, s.profile, s.fileMap), cs, nil)
+	res := s.orch.runStream(s.ctx, s.agentFor(RoleBuilder, ""),
+		designTask(design, buildUserMessage(design, s.profile, s.fileMap)), cs, nil)
 	cs.flush()
-	if err != nil {
-		failf("%v", err)
+	if res.Err != nil {
+		failf("%v", res.Err)
 	}
 	os.Stderr.WriteString("\n")
 	ok("Code generated")
-	if err := applyChanges(s.root, parseFileBlocks(code), s.yes); err != nil {
+	if err := applyChanges(s.root, parseFileBlocks(res.Output), s.yes); err != nil {
 		failf("%v", err)
 	}
 }

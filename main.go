@@ -11,7 +11,7 @@ import (
 
 // version is the release version; goreleaser overrides it at build time via
 // -ldflags "-X main.version=...".
-var version = "1.2.0"
+var version = "1.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -66,6 +66,8 @@ func printHelp() {
     OpenAI-compatible:       export OPENAI_API_KEY=...   `+dim("(-provider openai; OPENAI_BASE_URL for OpenRouter/Groq/local)")+`
     Timeout:                 export ARCHI_TIMEOUT=10m    `+dim("overall per-request cap (default: none)")+`
     Context budget:          export ARCHI_CONTEXT_TOKENS=48000 `+dim("grounding cap for design")+`
+    Agent concurrency:       export ARCHI_AGENT_CONCURRENCY=3 `+dim("agent worker pool size")+`
+    Run token budget:        export ARCHI_RUN_TOKENS=150000 `+dim("output-token budget per run")+`
 
   `+dim("Docs: https://github.com/devthedeveloper/archi")+`
 
