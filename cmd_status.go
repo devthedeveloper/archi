@@ -38,6 +38,9 @@ func cmdStatus(args []string) {
 		}
 		line("freshness", v)
 	}
+	if n, last := memoryStats(root); n > 0 {
+		line("memory", humanCount(n)+" decisions"+dim("  ·  last "+last))
+	}
 	os.Stderr.WriteString("\n")
 
 	// Live language bars from the cached totals.

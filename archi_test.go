@@ -396,7 +396,7 @@ func TestOpenAICompleteRetriesThenStreams(t *testing.T) {
 }
 
 func TestDesignUserMessageStructure(t *testing.T) {
-	msg := designUserMessage("PROFILE-TEXT", "MAP-TEXT", "", nil, "add caching")
+	msg := designUserMessage("PROFILE-TEXT", "MAP-TEXT", "", "", nil, "add caching")
 	for _, want := range []string{"CODEBASE PROFILE", "FILE MAP", "CHANGE REQUEST", "PROFILE-TEXT", "add caching"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("design message missing %q", want)
@@ -1611,7 +1611,7 @@ func TestCostLine(t *testing.T) {
 func TestDesignPromptsUnchanged(t *testing.T) {
 	fp := &fakeProvider{out: "doc"}
 	o := &Orchestrator{Trace: nopTrace(), started: time.Now()}
-	userMsg := designUserMessage("PROFILE", "MAP", "", nil, "add X")
+	userMsg := designUserMessage("PROFILE", "MAP", "", "", nil, "add X")
 	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: architectPrompt}, P: fp}
 	o.runStream(context.Background(), a, designTask("add X", userMsg), nil, nil)
 	if fp.gotSystem[0] != architectPrompt {
@@ -2052,8 +2052,8 @@ func TestRenderReviewNotes(t *testing.T) {
 }
 
 func TestFastModeGolden(t *testing.T) {
-	withBrief := designUserMessage("P", "M", "the brief", nil, "R")
-	noBrief := designUserMessage("P", "M", "", nil, "R")
+	withBrief := designUserMessage("P", "M", "the brief", "", nil, "R")
+	noBrief := designUserMessage("P", "M", "", "", nil, "R")
 	if strings.Contains(noBrief, "GROUNDING BRIEF") {
 		t.Error("empty brief must add nothing (fast mode byte-identical)")
 	}
@@ -2584,5 +2584,272 @@ func TestListBackupRuns(t *testing.T) {
 	}
 	if runs[1].restored != 1 || runs[1].created != 1 {
 		t.Errorf("v2 counts: %+v", runs[1])
+	}
+}
+
+// ── Phase 4+5: reviewers & memory ───────────────────────────────────────────
+
+func TestSplitDiffByFile(t *testing.T) {
+	multi := "diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/y.go b/y.go\n+++ b/y.go\n+z\n"
+	files := splitDiffByFile(multi)
+	if len(files) != 2 || files[0].path != "x.go" || files[1].path != "y.go" {
+		t.Errorf("multi-file: %+v", files)
+	}
+	bf := splitDiffByFile("--- a/z.go\n+++ b/z.go\n@@ -1 +1 @@\n-a\n+b\n")
+	if len(bf) != 1 || bf[0].path != "z.go" {
+		t.Errorf("bare patch: %+v", bf)
+	}
+	if splitDiffByFile("") != nil {
+		t.Error("empty diff should be nil")
+	}
+}
+
+func TestPackReviewChunks(t *testing.T) {
+	if len(packReviewChunks([]diffFile{{path: "a", body: "x"}, {path: "b", body: "y"}}, 1000)) != 1 {
+		t.Error("small files should fit in one chunk")
+	}
+	f := diffFile{path: "a", body: strings.Repeat("x", 400)}
+	g := diffFile{path: "b", body: strings.Repeat("y", 400)}
+	if n := len(packReviewChunks([]diffFile{f, g}, 120)); n != 2 {
+		t.Errorf("should split at boundary: %d", n)
+	}
+	ch := packReviewChunks([]diffFile{{path: "big", body: strings.Repeat("z", 10000)}}, 100)
+	if len(ch) != 1 || estimateTokens(ch[0][0].body) > 130 {
+		t.Errorf("oversized file should be truncated: %d tokens", estimateTokens(ch[0][0].body))
+	}
+}
+
+func TestReviewExitCode(t *testing.T) {
+	if reviewExitCode([]*Verdict{{Status: VerdictClean}}) != 0 {
+		t.Error("clean → 0")
+	}
+	if reviewExitCode([]*Verdict{{Status: VerdictAdvisory}}) != 0 {
+		t.Error("advisory → 0")
+	}
+	if reviewExitCode([]*Verdict{{Status: VerdictClean}, {Status: VerdictBlocking}}) != 1 {
+		t.Error("any blocking → 1")
+	}
+	if reviewExitCode([]*Verdict{nil, {Status: VerdictClean}}) != 0 {
+		t.Error("nil verdicts ignored")
+	}
+}
+
+func TestRenderReviewDoc(t *testing.T) {
+	results := []reviewResult{
+		{Role: RoleSecCritic, Verdict: &Verdict{Status: VerdictBlocking, Findings: []Finding{{Severity: VerdictBlocking, Title: "SQLi", Detail: "use params", Paths: []string{"a.go"}}}}},
+		{Role: RoleSimpCritic, Verdict: &Verdict{Status: VerdictAdvisory, Findings: []Finding{{Severity: VerdictAdvisory, Title: "dup", Detail: "reuse", Paths: []string{"b.go"}}}}},
+		{Role: RoleGrndCritic, Skipped: "no .archi cache"},
+	}
+	doc := renderReviewDoc("git diff HEAD", results)
+	for _, want := range []string{"# archi review — git diff HEAD", "| security | **blocking** | 1 |", "_skipped — no .archi cache_", "## Blocking", "1. **SQLi** — `a.go`", "## Advisory", "exit 1"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("missing %q in:\n%s", want, doc)
+		}
+	}
+	clean := renderReviewDoc("x", []reviewResult{{Role: RoleSecCritic, Verdict: &Verdict{Status: VerdictClean}}})
+	if strings.Contains(clean, "## Blocking") || strings.Contains(clean, "## Advisory") {
+		t.Error("clean review should omit finding sections")
+	}
+	if !strings.Contains(clean, "exit 0") {
+		t.Error("clean review exit 0")
+	}
+}
+
+func TestReadDesignDoc(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(designsDir(root), 0o755)
+	path := designHistoryPath(root, "add X", time.Now())
+	if err := writeDesignHistory(path, "add X", "prov", time.Now(), true, "## Summary\nbody\n"); err != nil {
+		t.Fatal(err)
+	}
+	fm, body, err := readDesignDoc(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm["request"] != "add X" || fm["built"] != "yes" {
+		t.Errorf("front-matter: %v", fm)
+	}
+	if !strings.Contains(body, "## Summary") {
+		t.Errorf("body: %q", body)
+	}
+}
+
+func TestResolveDesignArg(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(designsDir(root), 0o755)
+	if _, err := resolveDesignArg(root, "latest"); err == nil {
+		t.Error("no designs → error")
+	}
+	writeDesignHistory(designHistoryPath(root, "draft one", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), "draft one", "p", time.Now(), false, "d")
+	if p, err := resolveDesignArg(root, "latest"); err != nil || !strings.Contains(p, "draft-one") {
+		t.Errorf("draft fallback: %v %v", p, err)
+	}
+	writeDesignHistory(designHistoryPath(root, "built two", time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)), "built two", "p", time.Now(), true, "d")
+	if p, _ := resolveDesignArg(root, "latest"); !strings.Contains(p, "built-two") {
+		t.Errorf("should pick newest built: %v", p)
+	}
+}
+
+func TestExtractRepoPaths(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "real.go"), []byte("x"), 0o644)
+	os.MkdirAll(filepath.Join(root, "internal"), 0o755)
+	os.WriteFile(filepath.Join(root, "internal", "svc.go"), []byte("x"), 0o644)
+	paths := extractRepoPaths(root, "Touches `real.go` and internal/svc.go and missing.go and real.go again.", 20)
+	if !contains(paths, "real.go") || !contains(paths, "internal/svc.go") {
+		t.Errorf("expected real paths: %v", paths)
+	}
+	if contains(paths, "missing.go") {
+		t.Error("nonexistent path should be excluded")
+	}
+	if count(paths, "real.go") != 1 {
+		t.Error("paths should dedupe")
+	}
+}
+
+func TestSplitPlanAndFiles(t *testing.T) {
+	plan, blocks := splitPlanAndFiles("## Test plan\ntable\n=== FILE: a_test.go ===\n```go\ncode\n```\n")
+	if !strings.Contains(plan, "Test plan") || strings.Contains(plan, "=== FILE") {
+		t.Errorf("plan: %q", plan)
+	}
+	if !strings.Contains(blocks, "=== FILE: a_test.go ===") {
+		t.Errorf("blocks: %q", blocks)
+	}
+	if p, b := splitPlanAndFiles("just a plan, no files"); p != "just a plan, no files" || b != "" {
+		t.Errorf("plan only: %q %q", p, b)
+	}
+}
+
+func TestDesignDocsSince(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(designsDir(root), 0o755)
+	writeDesignHistory(designHistoryPath(root, "old one", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), "old one", "p", time.Now(), true, "old body")
+	writeDesignHistory(designHistoryPath(root, "new one", time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)), "new one", "p", time.Now(), true, "new body")
+	if all := designDocsSince(root, ""); len(all) != 2 {
+		t.Errorf("all: %d", len(all))
+	}
+	recent := designDocsSince(root, "20260201-000000")
+	if len(recent) != 1 || !strings.Contains(recent[0].content, "new body") {
+		t.Errorf("since filter: %+v", recent)
+	}
+}
+
+func TestSplitMemoryEntries(t *testing.T) {
+	if len(splitMemoryEntries("")) != 0 {
+		t.Error("empty → 0 entries")
+	}
+	e := splitMemoryEntries("preamble\n## 2026-01-01 a\nbody a\n## 2026-01-02 b\nbody b\n")
+	if len(e) != 2 || e[0].heading != "## 2026-01-01 a" || e[1].body != "body b" {
+		t.Errorf("entries: %+v", e)
+	}
+}
+
+func TestFitMemory(t *testing.T) {
+	s := "## 2026-01-01 a\n" + strings.Repeat("x ", 100) + "\n## 2026-01-02 b\nshort\n"
+	out := fitMemory(s, 20)
+	if !strings.Contains(out, "newest first") || !strings.Contains(out, "2026-01-02 b") {
+		t.Errorf("newest-first: %q", out)
+	}
+	if strings.Contains(out, "2026-01-01 a") {
+		t.Error("older entry should be omitted under a tight budget")
+	}
+	if !strings.Contains(out, "older entries omitted") {
+		t.Error("omission trailer expected")
+	}
+	all := fitMemory(s, 100000)
+	if !strings.Contains(all, "2026-01-01 a") || !strings.Contains(all, "2026-01-02 b") {
+		t.Error("generous budget should include all")
+	}
+	if fitMemory("", 100) != "" {
+		t.Error("empty → empty")
+	}
+}
+
+func TestFactLines(t *testing.T) {
+	m := factLines("- fact one\ntext\n- fact two\n**Decided:** not a bullet")
+	if !m["- fact one"] || !m["- fact two"] || m["**Decided:** not a bullet"] {
+		t.Errorf("factLines: %v", m)
+	}
+}
+
+func TestDedupEntryFacts(t *testing.T) {
+	out := dedupEntryFacts("**Facts:**\n- Deploys on Fly.io\n- New unique fact", map[string]bool{"- Deploys on Fly.io": true})
+	if strings.Contains(out, "Deploys on Fly.io") {
+		t.Error("duplicate fact should be removed")
+	}
+	if !strings.Contains(out, "New unique fact") || !strings.Contains(out, "**Facts:**") {
+		t.Errorf("unique/non-bullet lines kept: %q", out)
+	}
+}
+
+func TestAppendMemoryEntry(t *testing.T) {
+	root := t.TempDir()
+	tm := time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC)
+	if err := appendMemoryEntry(root, "add webhooks", tm, "**Decided:** X\n**Facts:**\n- Fact A"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(memoryPath(root))
+	if !strings.Contains(string(data), "## 2026-07-06 add-webhooks") {
+		t.Errorf("heading format: %q", data)
+	}
+	appendMemoryEntry(root, "another", tm, "**Decided:** Y\n**Facts:**\n- Fact A\n- Fact B")
+	data, _ = os.ReadFile(memoryPath(root))
+	if strings.Count(string(data), "- Fact A") != 1 {
+		t.Error("Fact A should not be duplicated")
+	}
+	if !strings.Contains(string(data), "- Fact B") {
+		t.Error("Fact B should be added")
+	}
+}
+
+func TestMemoryStats(t *testing.T) {
+	root := t.TempDir()
+	if n, _ := memoryStats(root); n != 0 {
+		t.Error("no memory → 0")
+	}
+	os.MkdirAll(memoryDir(root), 0o755)
+	os.WriteFile(memoryPath(root), []byte("## 2026-01-01 a\nx\n## 2026-07-04 b\ny\n"), 0o644)
+	if n, last := memoryStats(root); n != 2 || last != "2026-07-04" {
+		t.Errorf("stats: %d %q", n, last)
+	}
+}
+
+func TestValidCompactedMemory(t *testing.T) {
+	orig := "## a\nx\n## b\ny\n## c\nz\n## d\nw\n## e\nv\n"
+	if validCompactedMemory(orig, "") {
+		t.Error("empty is invalid")
+	}
+	if validCompactedMemory(orig, "no headings") {
+		t.Error("heading-less is invalid")
+	}
+	if validCompactedMemory(orig, "## only\none") {
+		t.Error("1 of 5 (<25%) is invalid")
+	}
+	if !validCompactedMemory(orig, "## a\nx\n## b\ny\n") {
+		t.Error("2 of 5 is valid")
+	}
+}
+
+func TestDocStamp(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(archiDir(root), 0o755)
+	if lastDocStamp(root) != "" {
+		t.Error("missing → empty")
+	}
+	if err := writeDocStamp(root, time.Date(2026, 7, 6, 15, 30, 12, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastDocStamp(root); got != "20260706-153012" {
+		t.Errorf("round-trip: %q", got)
+	}
+}
+
+func TestMemoryInDesignMessage(t *testing.T) {
+	withMem := designUserMessage("P", "M", "", "MEMORY-TEXT", nil, "R")
+	if !strings.Contains(withMem, "TEAM MEMORY") || !strings.Contains(withMem, "MEMORY-TEXT") {
+		t.Error("non-empty memory should insert a section")
+	}
+	if strings.Contains(designUserMessage("P", "M", "", "", nil, "R"), "TEAM MEMORY") {
+		t.Error("empty memory must add nothing")
 	}
 }

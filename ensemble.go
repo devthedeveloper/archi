@@ -105,7 +105,7 @@ func (s *session) designEnsemble(request, interview string, live io.Writer) (str
 		os.Stderr.WriteString("\n")
 	}
 	res := s.orch.runStream(s.ctx, designer,
-		designTask(request, designUserMessage(s.profile, s.fileMap, brief, s.focus, req)), live, nil)
+		designTask(request, designUserMessage(s.profile, s.fileMap, brief, s.memory, s.focus, req)), live, nil)
 	if res.Err != nil {
 		return "", res.Err
 	}

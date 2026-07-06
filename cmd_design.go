@@ -141,6 +141,8 @@ func cmdDesign(args []string) {
 		swarm:     *swarm == "on" || (*swarm == "" && opts.mode == "full"),
 		verify:    *verifyFlag != "off",
 		maxRepair: *maxRepair,
+		request:   request,
+		memory:    fitMemory(loadMemory(root), memoryBudget()),
 	}
 	sess.orch = newOrchestrator(root)
 
@@ -168,9 +170,12 @@ type session struct {
 	orch        *Orchestrator // agent runtime: traces every call, charges the run budget
 	opts        ensembleOpts  // resolved -agents/-critic-model/-rounds
 	criticMk    providerFactory
-	swarm       bool // split the build into parallel packets
-	verify      bool // run the toolchain after applying
-	maxRepair   int  // max verify/repair iterations
+	swarm       bool   // split the build into parallel packets
+	verify      bool   // run the toolchain after applying
+	maxRepair   int    // max verify/repair iterations
+	request     string // the original design request (for memory)
+	interview   string // clarifying Q&A transcript (for memory + grounding)
+	memory      string // fitted team memory, "" when none
 }
 
 // agentFor binds a registered spec to the session's provider for that role
@@ -219,13 +224,14 @@ func (s *session) runInteractive(request string) {
 	// Phase 1 — clarify.
 	sp := startSpinner("Working out what to ask")
 	res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, clarifyPrompt),
-		designTask(request, clarifyUserMessage(s.profile, s.fileMap, s.focus, request)), nil, sp)
+		designTask(request, clarifyUserMessage(s.profile, s.fileMap, s.focus, request, s.memory)), nil, sp)
 	if res.Err != nil {
 		sp.Abort()
 		failf("%v", res.Err)
 	}
 	sp.Stop("Questions ready")
 	answers := askQuestions(parseQuestions(res.Output))
+	s.interview = answers
 
 	// Phase 2 — design. Full mode runs the ensemble; fast/off is byte-identical.
 	var doc string
@@ -242,7 +248,7 @@ func (s *session) runInteractive(request string) {
 		info("Designing …")
 		os.Stderr.WriteString("\n")
 		res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
-			designTask(request, designUserMessage(s.profile, s.fileMap, "", s.focus, req)), os.Stdout, nil)
+			designTask(request, designUserMessage(s.profile, s.fileMap, "", s.memory, s.focus, req)), os.Stdout, nil)
 		if res.Err != nil {
 			failf("%v", res.Err)
 		}
@@ -341,7 +347,7 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 			}
 		}
 	} else {
-		task := designTask(request, designUserMessage(s.profile, s.fileMap, "", s.focus, request))
+		task := designTask(request, designUserMessage(s.profile, s.fileMap, "", s.memory, s.focus, request))
 		if live {
 			os.Stderr.WriteString("\n")
 			res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, os.Stdout, nil)
@@ -458,12 +464,15 @@ func (s *session) buildSwarm(design string) {
 	s.applyAndVerify(design, merged)
 }
 
-// applyAndVerify applies the generated changes and, on success, runs the
-// verify/repair loop when -verify is on.
+// applyAndVerify applies the generated changes and, on success, records a
+// memory entry and runs the verify/repair loop when -verify is on.
 func (s *session) applyAndVerify(design string, changes []fileChange) {
 	applied, stamp, err := applyChanges(s.root, changes, s.yes)
 	if err != nil {
 		failf("%v", err)
+	}
+	if applied {
+		recordMemory(s.ctx, s.mk, s.root, s.request, s.interview, design, "build applied")
 	}
 	if applied && s.verify {
 		s.repairLoop(s.ctx, s.orch, design, stamp)

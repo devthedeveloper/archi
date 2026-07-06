@@ -149,9 +149,10 @@ func refreshUserMessage(profileMD, mapMD, drift string, changed []seedFile, remo
 }
 
 // designUserMessage assembles the design request: profile, map, an optional
-// explorer brief, focus files, and the task. A "" brief is omitted entirely, so
-// fast-mode output stays byte-identical to before the brief was added.
-func designUserMessage(profileMD, mapMD, brief string, focus []seedFile, request string) string {
+// explorer brief, optional team memory, focus files, and the task. Empty brief
+// and memory are omitted entirely, so fast-mode output stays byte-identical to
+// before those were added.
+func designUserMessage(profileMD, mapMD, brief, memory string, focus []seedFile, request string) string {
 	var b strings.Builder
 	b.WriteString("=== CODEBASE PROFILE ===\n\n")
 	b.WriteString(profileMD)
@@ -160,6 +161,11 @@ func designUserMessage(profileMD, mapMD, brief string, focus []seedFile, request
 	if brief != "" {
 		b.WriteString("\n=== GROUNDING BRIEF (from the explorer) ===\n\n")
 		b.WriteString(brief)
+		b.WriteString("\n")
+	}
+	if memory != "" {
+		b.WriteString("\n=== TEAM MEMORY (past decisions — honor them; don't re-ask or re-propose) ===\n\n")
+		b.WriteString(memory)
 		b.WriteString("\n")
 	}
 	if len(focus) > 0 {
@@ -219,9 +225,9 @@ To delete a file, output a single line:
 Rules: full file contents (never diffs or ellipses). Real paths from the map. Keep
 changes minimal and idiomatic. Include any new tests the design calls for.`
 
-// clarifyUserMessage assembles the interview request.
-func clarifyUserMessage(profileMD, mapMD string, focus []seedFile, request string) string {
-	return designUserMessage(profileMD, mapMD, "", focus, request) + "\n\nAsk your clarifying questions now, in the required block format."
+// clarifyUserMessage assembles the interview request, with optional team memory.
+func clarifyUserMessage(profileMD, mapMD string, focus []seedFile, request, memory string) string {
+	return designUserMessage(profileMD, mapMD, "", memory, focus, request) + "\n\nAsk your clarifying questions now, in the required block format."
 }
 
 // reviseUserMessage asks the model to revise a design given requested changes.
@@ -380,4 +386,167 @@ func repairUserMessage(designSummary, cmd, output string, files []seedFile) stri
 		"\n\n=== OUTPUT ===\n" + output +
 		"\n\n=== IMPLICATED FILES ===\n" + fenceFiles(files) +
 		"\n\nOutput the minimal fix now, file blocks only."
+}
+
+// verdictTrailer is appended to every review prompt so parseVerdict applies.
+const verdictTrailer = "\n\nEnd your review with EXACTLY one fenced block in this format (status is the worst\n" +
+	"severity present; use \"clean\" with no findings when nothing is wrong):\n\n" +
+	"```verdict\n" +
+	"status: blocking\n" +
+	"- [blocking] Title of finding | path/a.go, path/b.go\n" +
+	"  One or two sentences of detail, ending with a concrete suggested fix.\n" +
+	"- [advisory] Another finding | path/c.go\n" +
+	"  Detail and suggested fix.\n" +
+	"```"
+
+const reviewSecPrompt = `You are a security reviewer examining a code diff. You may also be given a profile
+of the codebase for context. Review ONLY what the diff changes — do not audit
+unchanged code. Look for: injection (SQL, shell, template, path), missing or weakened
+authn/authz, secrets or credentials in code or logs, unsafe deserialization, SSRF,
+path traversal, insecure defaults, missing input validation at trust boundaries, and
+crypto misuse. Every finding must name the file path(s) from the diff and include a
+concrete suggested fix. Severity: "blocking" only for exploitable or data-exposing
+issues; hardening ideas are "advisory". Do not pad — an empty review is a valid
+review.` + verdictTrailer
+
+const reviewSimpPrompt = `You are a simplicity reviewer examining a code diff. You may also be given a profile
+of the codebase for context. Review ONLY what the diff changes. Look for:
+over-engineering, premature abstraction, unnecessary new dependencies or infra,
+duplicated logic that existing code already provides, dead or unreachable additions,
+API surface larger than the need, and YAGNI violations. Every finding must name the
+file path(s) from the diff and include a concrete simpler alternative. Severity:
+"blocking" only when the complexity will actively mislead or break maintainers;
+otherwise "advisory". Do not pad — an empty review is a valid review.` + verdictTrailer
+
+const reviewGroundingPrompt = `You are a grounding reviewer examining a code diff against a PROFILE of the real
+codebase. Your single job: find where the diff contradicts the actual repository —
+calls to functions or files that do not exist, imports the project does not use,
+violations of the stated conventions (error handling, config, naming, testing style),
+and stack choices the profile does not support. Every finding MUST cite the file
+path(s) involved; a finding without a path will be discarded. Severity: "blocking"
+for references to things that do not exist; convention drift is "advisory". Do not
+pad — an empty review is a valid review.` + verdictTrailer
+
+const reviewerPrompt = `You are a senior engineer giving a single consolidated review of a code diff,
+optionally with a profile of the codebase for context. Cover correctness, security,
+and simplicity in one pass, reviewing ONLY what the diff changes. Every finding names
+its file path(s) and a concrete suggested fix. Do not pad — an empty review is a
+valid review.` + verdictTrailer
+
+const testWriterPrompt = `You are a senior engineer writing tests for a change that was designed and built in
+a specific codebase. You are given the approved design document, the codebase profile,
+the file map, and the current contents of the files the change touches. Match the
+repo's existing test framework, naming, and layout exactly (see the profile's
+Conventions section) — never introduce a new test framework.
+
+Output two parts, in order:
+
+1. A test plan in GitHub-Flavored Markdown: "## Test plan" then a table
+   Behavior | Kind (unit/integration) | File — covering the design's risk areas first.
+2. The test files themselves, using EXACTLY this block format, full file contents,
+   no prose between blocks:
+
+=== FILE: relative/path/from/repo/root ===
+` + "```language\n" + `<complete file contents>
+` + "```" + `
+
+Only create or replace test files. Never modify production source files.`
+
+const docWriterPrompt = `You are a technical writer keeping a repository's documentation in sync with what
+was recently designed and built. You are given the codebase profile, the current
+README (possibly empty), existing docs pages, and the design documents produced since
+the docs were last updated. Update the docs to reflect what those designs added or
+changed: new commands, flags, endpoints, modules, configuration, and behavior. Keep
+the existing voice, structure, and formatting; make the smallest edits that restore
+accuracy; never delete sections you cannot verify are obsolete; never invent features
+the designs do not describe.
+
+Output ONLY file blocks (full contents, no prose outside blocks):
+
+=== FILE: relative/path ===
+` + "```markdown\n" + `<complete file contents>
+` + "```" + `
+
+Only touch documentation files (README.md, docs/**). If nothing needs updating,
+output nothing at all.`
+
+const memorySummarizerPrompt = `You distill one completed design-and-build session into a single durable memory
+entry for future sessions. You are given the final design document, the interview
+transcript (requester Q&A, possibly empty), and the build outcome. Extract only what
+will still matter months from now — decisions, rejections, constraints, and stable
+facts about the team or system ("deploys on Fly.io", "no new infra without approval").
+Never include transient details (line counts, token counts, model names) or anything
+speculative.
+
+Output EXACTLY these four fields, no heading, no preamble, nothing else:
+
+**Decided:** <one or two sentences — the approach chosen and the key reason>
+**Rejected:** <alternatives considered and why they lost; "None recorded." if none>
+**Constraints:** <hard constraints revealed, comma-separated; "None recorded." if none>
+**Facts:**
+- <one durable fact per line, as a "- " bullet; omit the bullets entirely if none>`
+
+const memoryCompactorPrompt = `You are compacting a team memory file of dated "## <date> <slug>" entries, each with
+**Decided / Rejected / Constraints / Facts** fields. Rewrite the file so it is smaller
+but loses no decision: merge entries about the same topic into the newest entry
+(keeping its heading), delete duplicate or superseded facts, and drop entries fully
+obsoleted by a later decision. Preserve chronological order, the exact heading format,
+and the exact four-field format. Never invent, reword facts beyond merging, or add
+commentary. Output ONLY the rewritten file contents.`
+
+// reviewSpecs returns the three review-critic specs (reusing the critic roles).
+func reviewSpecs() []AgentSpec {
+	return []AgentSpec{
+		{Role: RoleSecCritic, System: reviewSecPrompt, MaxTokens: 2000, Temp: 0},
+		{Role: RoleSimpCritic, System: reviewSimpPrompt, MaxTokens: 2000, Temp: 0},
+		{Role: RoleGrndCritic, System: reviewGroundingPrompt, MaxTokens: 2000, Temp: 0},
+	}
+}
+
+// reviewUserMessage assembles a diff-review request.
+func reviewUserMessage(profile, diff string) string {
+	var b strings.Builder
+	if profile != "" {
+		b.WriteString("=== CODEBASE PROFILE ===\n\n" + profile + "\n\n")
+	}
+	b.WriteString("=== DIFF ===\n\n```diff\n" + diff + "\n```\n\nReview the diff now.")
+	return b.String()
+}
+
+// testPlanUserMessage assembles a test-generation request for a saved design.
+func testPlanUserMessage(profile, design, mapMD string, touched []seedFile, memory string) string {
+	var b strings.Builder
+	b.WriteString("=== CODEBASE PROFILE ===\n\n" + profile + "\n\n")
+	b.WriteString("=== APPROVED DESIGN ===\n\n" + design + "\n\n")
+	b.WriteString("=== FILE MAP ===\n\n" + mapMD + "\n")
+	if memory != "" {
+		b.WriteString("\n=== TEAM MEMORY ===\n\n" + memory + "\n")
+	}
+	b.WriteString("\n=== FILES THE CHANGE TOUCHES ===\n" + fenceFiles(touched))
+	b.WriteString("\n\nWrite the test plan and test files now.")
+	return b.String()
+}
+
+// docUserMessage assembles a documentation-sync request.
+func docUserMessage(profile, readme string, docs, designs []seedFile) string {
+	var b strings.Builder
+	b.WriteString("=== CODEBASE PROFILE ===\n\n" + profile + "\n\n")
+	b.WriteString("=== CURRENT README ===\n```markdown\n" + readme + "\n```\n")
+	if len(docs) > 0 {
+		b.WriteString("\n=== EXISTING DOCS ===\n" + fenceFiles(docs))
+	}
+	b.WriteString("\n=== DESIGNS SINCE LAST DOC UPDATE ===\n" + fenceFiles(designs))
+	b.WriteString("\n\nUpdate the documentation now.")
+	return b.String()
+}
+
+// memorySummaryUserMessage assembles the summarizer request.
+func memorySummaryUserMessage(design, interview, outcome string) string {
+	var b strings.Builder
+	b.WriteString("=== FINAL DESIGN ===\n\n" + design + "\n\n")
+	if interview != "" {
+		b.WriteString("=== INTERVIEW ===\n\n" + interview + "\n\n")
+	}
+	b.WriteString("=== BUILD OUTCOME ===\n\n" + outcome + "\n\nDistill the memory entry now.")
+	return b.String()
 }

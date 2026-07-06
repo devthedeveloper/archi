@@ -11,7 +11,7 @@ import (
 
 // version is the release version; goreleaser overrides it at build time via
 // -ldflags "-X main.version=...".
-var version = "1.5.0"
+var version = "1.6.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -27,6 +27,14 @@ func main() {
 		cmdStatus(os.Args[2:])
 	case "rollback":
 		cmdRollback(os.Args[2:])
+	case "review":
+		cmdReview(os.Args[2:])
+	case "test-plan":
+		cmdTestPlan(os.Args[2:])
+	case "doc":
+		cmdDoc(os.Args[2:])
+	case "memory":
+		cmdMemory(os.Args[2:])
 	case "version", "-version", "--version", "-v":
 		fmt.Println("archi", version)
 	case "help", "-h", "--help":
@@ -48,6 +56,10 @@ func printHelp() {
     `+cyan("init")+`   [path]        Learn a codebase — scan it and cache an understanding
     `+cyan("design")+` "<request>"   Design a change, grounded in the learned codebase
     `+cyan("status")+`               Show what archi has learned about this repo
+    `+cyan("review")+`               Review a diff with the critic panel — CI-friendly
+    `+cyan("test-plan")+`            Generate a test plan + tests for a saved design
+    `+cyan("doc")+`                  Sync README/docs with what was designed & built
+    `+cyan("memory")+`               Show, edit, or compact archi's decision memory
     `+cyan("rollback")+`             Restore the files a build run overwrote or created
     `+cyan("version")+`              Print the version
 
