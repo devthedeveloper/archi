@@ -15,11 +15,12 @@ type fileInfo struct {
 }
 
 // scanRepo walks root and returns matching files in stable sorted order,
-// honoring the root .gitignore and skipping .git, dotfiles, and dot-dirs.
+// honoring .gitignore files (root and nested) and skipping .git, dotfiles,
+// dot-dirs, and secret-bearing files.
 func scanRepo(root string) ([]fileInfo, error) {
-	ignore := &gitignore{}
+	ignore := &ignoreChain{}
 	if data, err := os.ReadFile(filepath.Join(root, ".gitignore")); err == nil {
-		ignore = parseGitignore(strings.NewReader(string(data)))
+		ignore.add("", parseGitignore(strings.NewReader(string(data))))
 	}
 
 	var files []fileInfo
@@ -42,6 +43,11 @@ func scanRepo(root string) ([]fileInfo, error) {
 			}
 			return nil
 		}
+		// Secret-bearing files (.env, *.pem, *.key, id_rsa*) never enter the
+		// scan, so their contents can't reach a prompt even before redaction.
+		if !d.IsDir() && isSecretFile(rel) {
+			return nil
+		}
 		if ignore.Match(rel, d.IsDir()) {
 			if d.IsDir() {
 				return filepath.SkipDir
@@ -49,6 +55,12 @@ func scanRepo(root string) ([]fileInfo, error) {
 			return nil
 		}
 		if d.IsDir() {
+			// A nested .gitignore governs everything under its directory;
+			// the walk visits a directory before its children, so patterns
+			// are in place before anything they could match.
+			if data, err := os.ReadFile(filepath.Join(path, ".gitignore")); err == nil {
+				ignore.add(rel, parseGitignore(strings.NewReader(string(data))))
+			}
 			return nil
 		}
 		info, err := d.Info()

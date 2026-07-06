@@ -9,7 +9,9 @@ import (
 	"os"
 )
 
-const version = "1.1.2"
+// version is the release version; goreleaser overrides it at build time via
+// -ldflags "-X main.version=...".
+var version = "1.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -61,6 +63,9 @@ func printHelp() {
   `+bold("SETUP")+`
     Ollama Cloud (default):  export OLLAMA_API_KEY=...   `+dim("or OLLAMA_HOST for local")+`
     Anthropic:               export ANTHROPIC_API_KEY=... `+dim("(-provider anthropic)")+`
+    OpenAI-compatible:       export OPENAI_API_KEY=...   `+dim("(-provider openai; OPENAI_BASE_URL for OpenRouter/Groq/local)")+`
+    Timeout:                 export ARCHI_TIMEOUT=10m    `+dim("overall per-request cap (default: none)")+`
+    Context budget:          export ARCHI_CONTEXT_TOKENS=48000 `+dim("grounding cap for design")+`
 
   `+dim("Docs: https://github.com/devthedeveloper/archi")+`
 
@@ -72,9 +77,10 @@ func initUsage() {
 
   Scan a repository and cache an understanding in .archi/.
 
-  -provider string   LLM provider: ollama or anthropic (default "ollama")
+  -provider string   LLM provider: ollama, anthropic, or openai (default "ollama")
   -model string      model id (default: provider default)
   -force             rebuild even if .archi already exists
+  -refresh           update an existing cache incrementally from what changed
   -max-file-kb int   skip files larger than this when sampling (default 256)
 `)
 }

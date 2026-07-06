@@ -1,0 +1,89 @@
+# goreleaser configuration (v2) — https://goreleaser.com
+#
+# Releases are cut by pushing a semver tag:
+#
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# The Release workflow (.github/workflows/release.yml) runs the tests and then
+# `goreleaser release --clean`, which builds static binaries for every
+# platform below, packages them, generates checksums + a changelog, and
+# publishes a GitHub Release.
+#
+# Local dry run: `goreleaser release --snapshot --clean`
+version: 2
+
+project_name: archi
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: .
+    binary: archi
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # 32-bit-era pairing nobody asks for; keep the matrix small.
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  footer: |
+    ---
+    Install with `go install github.com/devthedeveloper/archi@{{ .Tag }}`,
+    or download a binary above (`archi_*_<os>_<arch>`), unpack, and put
+    `archi` on your PATH.
+
+# --- Homebrew tap (optional) -------------------------------------------------
+# To enable `brew install devthedeveloper/tap/archi`:
+#   1. Create the repo github.com/devthedeveloper/homebrew-tap
+#   2. Add a repo secret HOMEBREW_TAP_TOKEN (a PAT with repo scope on the tap)
+#   3. Uncomment this block; the release workflow already passes the token.
+#
+# brews:
+#   - repository:
+#       owner: devthedeveloper
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: https://github.com/devthedeveloper/archi
+#     description: "An architect that knows your codebase"
+#     license: MIT
+#     test: |
+#       system "#{bin}/archi", "version"

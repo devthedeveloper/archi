@@ -21,10 +21,10 @@ type Config struct {
 	ApproxTokens  int            `json:"approxTokens"`
 }
 
-func archiDir(root string) string     { return filepath.Join(root, archiDirName) }
-func mapPath(root string) string      { return filepath.Join(archiDir(root), "map.md") }
-func profilePath(r string) string     { return filepath.Join(archiDir(r), "profile.md") }
-func configPath(root string) string   { return filepath.Join(archiDir(root), "config.json") }
+func archiDir(root string) string    { return filepath.Join(root, archiDirName) }
+func mapPath(root string) string     { return filepath.Join(archiDir(root), "map.md") }
+func profilePath(r string) string    { return filepath.Join(archiDir(r), "profile.md") }
+func configPath(root string) string  { return filepath.Join(archiDir(root), "config.json") }
 func fingerprintPath(r string) string { return filepath.Join(archiDir(r), "fingerprint") }
 
 func loadConfig(root string) (*Config, error) {

@@ -39,6 +39,12 @@ func (o *ollamaProvider) Complete(ctx context.Context, system, user string, prog
 		return "", errors.New("OLLAMA_API_KEY is not set (needed for Ollama Cloud; set OLLAMA_HOST for a local server)")
 	}
 
+	ctx, cancel, err := requestContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+
 	body, _ := json.Marshal(map[string]any{
 		"model": o.model,
 		"messages": []map[string]string{
@@ -52,16 +58,17 @@ func (o *ollamaProvider) Complete(ctx context.Context, system, user string, prog
 		},
 	})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
-
-	resp, err := sharedClient.Do(req)
+	resp, err := doWithRetry(ctx, sharedClient, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/api/chat", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		return req, nil
+	})
 	if err != nil {
 		return "", err
 	}

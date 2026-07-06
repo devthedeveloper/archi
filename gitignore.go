@@ -89,6 +89,50 @@ func globToRegex(glob string) string {
 	return b.String()
 }
 
+// ignoreChain layers scoped .gitignore files — the root one plus any found in
+// subdirectories — following git semantics: a file's patterns only apply to
+// paths under its own directory, matched relative to that directory, and the
+// last matching pattern (deeper files come later) wins.
+type ignoreChain struct {
+	scopes []scopedIgnore
+}
+
+// scopedIgnore is one parsed .gitignore bound to the directory it lives in.
+type scopedIgnore struct {
+	dir string // slash-separated dir relative to root; "" for the root file
+	ig  *gitignore
+}
+
+// add registers a parsed .gitignore scoped to dir ("" for the repo root).
+// Callers must add parents before children so precedence follows git.
+func (c *ignoreChain) add(dir string, ig *gitignore) {
+	if ig == nil || len(ig.patterns) == 0 {
+		return
+	}
+	c.scopes = append(c.scopes, scopedIgnore{dir: dir, ig: ig})
+}
+
+// Match reports whether relPath (slash-separated, relative to root) is ignored
+// by any .gitignore in the chain that governs it.
+func (c *ignoreChain) Match(relPath string, isDir bool) bool {
+	ignored := false
+	for _, s := range c.scopes {
+		sub := relPath
+		if s.dir != "" {
+			if !strings.HasPrefix(relPath, s.dir+"/") {
+				continue // this .gitignore doesn't govern relPath
+			}
+			sub = relPath[len(s.dir)+1:]
+		}
+		for _, p := range s.ig.patterns {
+			if p.matches(sub, isDir) {
+				ignored = !p.negate
+			}
+		}
+	}
+	return ignored
+}
+
 // Match reports whether relPath (slash-separated, no trailing slash) is ignored.
 func (g *gitignore) Match(relPath string, isDir bool) bool {
 	if len(g.patterns) == 0 {

@@ -44,6 +44,17 @@ naming, dependency style, how the app is built/run.
 Where execution starts and the commands to build/test/run, drawn from manifests and
 scripts.`
 
+const refreshPrompt = `You are a staff engineer keeping an existing codebase profile up to date. You are
+given the CURRENT PROFILE of a repository, its refreshed file map, a summary of what
+changed since the profile was written, and the contents of the added and modified
+files. Produce the UPDATED profile: keep everything still accurate, revise only what
+the changes contradict, and fold in anything genuinely new. Do not invent things not
+evidenced by the files. Where you infer, say "likely".
+
+Output GitHub-Flavored Markdown with EXACTLY the same sections as the current
+profile, in order, no preamble: ## Stack, ## Architecture, ## Key modules,
+## Data & external systems, ## Conventions, ## Entry points & how to run.`
+
 const architectPrompt = `You are a principal software architect embedded in a specific codebase. You are given
 a PROFILE of that codebase, its file map, optionally some focus files, and a change
 request. Produce ONE design document to implement that change so it fits THIS codebase
@@ -112,6 +123,28 @@ func analystUserMessage(mapMD string, seed []seedFile) string {
 	b.WriteString("\n=== KEY FILES ===\n")
 	b.WriteString(fenceFiles(seed))
 	b.WriteString("\nWrite the codebase profile now.")
+	return b.String()
+}
+
+// refreshUserMessage assembles the incremental-refresh request: the current
+// profile, the regenerated map, the drift summary, and only what changed.
+func refreshUserMessage(profileMD, mapMD, drift string, changed []seedFile, removed []string) string {
+	var b strings.Builder
+	b.WriteString("=== CURRENT PROFILE ===\n\n")
+	b.WriteString(profileMD)
+	b.WriteString("\n\n=== FILE MAP (refreshed) ===\n\n")
+	b.WriteString(mapMD)
+	b.WriteString("\n=== WHAT CHANGED SINCE THE PROFILE WAS WRITTEN ===\n\n")
+	b.WriteString(drift + "\n")
+	if len(removed) > 0 {
+		b.WriteString("\nRemoved files:\n")
+		for _, rel := range removed {
+			b.WriteString("- " + rel + "\n")
+		}
+	}
+	b.WriteString("\n=== ADDED & MODIFIED FILES ===\n")
+	b.WriteString(fenceFiles(changed))
+	b.WriteString("\nWrite the updated codebase profile now.")
 	return b.String()
 }
 

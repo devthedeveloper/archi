@@ -18,7 +18,8 @@ In a terminal, `archi design` is a conversation:
 2. **It designs** — a grounded doc with Mermaid diagrams, streamed live.
 3. **You decide** — `approve & build` · `modify` · `ask a question` · `write to file`.
 4. **It builds** — on approval, it generates the actual files, shows a
-   create/overwrite/delete summary, backs up anything it overwrites, and writes them.
+   create/overwrite/delete summary with a colored unified diff for every overwrite,
+   backs up the originals, and writes them.
 
 Most "AI architect" tools design in a vacuum and hand you a generic diagram. `archi`
 reads your actual repository first, so every plan — and every generated file —
@@ -37,21 +38,35 @@ with diagrams that render straight on GitHub.
 ## Features
 
 - **Codebase-aware.** `init` scans the repo and caches a profile + file map in `.archi/`.
+- **Stays current.** A repo fingerprint detects drift — `design` and `status` warn
+  when the cache is stale, and `init -refresh` updates it from only what changed.
 - **Interviews first.** Asks the decision-critical questions — with scenarios — before designing.
 - **Grounded designs.** Plans reference your real directories, packages, and files.
-- **Builds the code.** Approve a design and archi generates the files, with backups and a path guard.
+- **Builds the code.** Approve a design and archi generates the files, with diff
+  previews, versioned backups, and a path guard.
+- **Design history.** Every design is saved under `.archi/designs/`;
+  `archi status` lists the most recent ones and whether they were built.
+- **Secrets stay home.** Likely credentials are redacted to `[REDACTED]` before any
+  file content is sent, and obvious secret files are never scanned at all.
 - **Mermaid diagrams** that render on GitHub; `-html` renders them drawn in a browser.
-- **Pluggable LLM backend.** Ollama Cloud (GLM) by default, or Anthropic (Claude).
+- **Pluggable LLM backend.** Ollama Cloud (GLM) by default, Anthropic (Claude), or any
+  OpenAI-compatible API (OpenAI, OpenRouter, Groq, local servers).
 - **Streaming, with a clean pipe.** Watch it work; redirect and you get pure Markdown.
 - **Zero dependencies.** Pure Go standard library. One static binary.
 
 ## Install
 
+**Prebuilt binaries** — grab the archive for your platform from the
+[releases page](https://github.com/devthedeveloper/archi/releases), unpack it,
+and put `archi` on your `PATH`. Linux, macOS, and Windows, amd64 + arm64.
+
+**With Go:**
+
 ```sh
 go install github.com/devthedeveloper/archi@latest
 ```
 
-Or build from source:
+**From source:**
 
 ```sh
 git clone https://github.com/devthedeveloper/archi
@@ -70,6 +85,25 @@ export OLLAMA_HOST=http://localhost:11434
 
 # Anthropic (use with -provider anthropic)
 export ANTHROPIC_API_KEY=...
+
+# OpenAI (use with -provider openai)
+export OPENAI_API_KEY=...
+# ...or any OpenAI-compatible API — OpenRouter, Groq, vLLM, llama.cpp, ...
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1   # default: https://api.openai.com/v1
+```
+
+### Timeouts & retries
+
+Transient failures — HTTP 429, 5xx, and network errors — are retried up to 3 times
+with exponential backoff and jitter, honoring the server's `Retry-After` header
+(capped at 30s). Retries never re-request a stream that has already started.
+
+There is no overall request timeout by default (long streamed designs are normal),
+but connecting and waiting for response headers time out after ~60s so a dead
+server fails fast. To cap the whole request, streaming included, set:
+
+```sh
+export ARCHI_TIMEOUT=10m   # any Go duration string, e.g. 90s, 10m
 ```
 
 ## Usage
@@ -84,10 +118,22 @@ archi status                   # what archi has learned here
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-provider` | `ollama` | `ollama` or `anthropic` |
-| `-model` | provider default | model id (`glm-5.2:cloud`, `claude-fable-5`, …) |
+| `-provider` | `ollama` | `ollama`, `anthropic`, or `openai` |
+| `-model` | provider default | model id (`glm-5.2:cloud`, `claude-fable-5`, `gpt-5.2`, …) |
 | `-force` | off | rebuild even if `.archi/` exists |
+| `-refresh` | off | update an existing cache incrementally from what changed |
 | `-max-file-kb` | `256` | skip files larger than this when sampling |
+
+`init` also writes `.archi/fingerprint` — one `hash  path` line per scanned file,
+hashing path + size + mtime — so archi can later tell, from stats alone, whether the
+repo has drifted from the cache.
+
+`archi init -refresh` rescans, diffs against that fingerprint, regenerates `map.md`
+deterministically, and asks the model to *revise* the existing profile from only the
+added and modified files (redacted like any other sample) — much cheaper than a full
+rebuild. It keeps the provider/model the cache was built with unless you override
+them, and if more than 40% of the fingerprinted files were touched it falls back to
+a full rebuild automatically. `-force` still means a full rebuild.
 
 ### `archi design`
 
@@ -108,6 +154,26 @@ with `-no-interactive`, it just prints the design (so it stays scriptable).
 | `-max-tokens` | `8000` | max output tokens for the design |
 | `-no-stream` | off | wait for the full response instead of streaming |
 
+If the repo has changed since `init`, `design` warns — e.g.
+`repo has changed since init: 12 files added/modified, 3 removed — consider archi
+init -refresh` — and continues with the cached understanding.
+
+The grounding context (profile + map + focus files) is capped at ~48k tokens: the
+profile always ships whole, the file map is head-truncated if it must be, and focus
+files are included in order until the budget runs out — anything truncated or
+dropped is named in a warning. Raise or lower the cap with:
+
+```sh
+export ARCHI_CONTEXT_TOKENS=96000
+```
+
+### `archi status`
+
+Shows what archi has learned: provider, language breakdown, recent designs, and a
+**freshness** line — `fresh` when the repo still matches the fingerprint, or the
+drift summary (`12 files added/modified, 3 removed`) with a nudge to
+`archi init -refresh`, plus the age of the cache.
+
 ### Examples
 
 ```sh
@@ -120,8 +186,16 @@ archi design -no-interactive -build -yes "add a health check endpoint"  # script
 archi design -provider anthropic "shard the events table"
 ```
 
-When archi builds, any file it overwrites is backed up to `<file>.bak`, and paths that
-would escape the repo are refused.
+When archi builds, the proposed-changes preview shows a unified diff for every file
+it would overwrite (capped at ~200 lines per file) before asking for confirmation,
+and it warns — without blocking — if the repo has uncommitted git changes. Every
+file it overwrites or deletes is first copied to `.archi/backups/<timestamp>/`,
+preserving relative paths, with a `manifest.txt` listing the run's files; the 10
+most recent backup runs are kept. Paths that would escape the repo are refused.
+
+Each design is also saved to `.archi/designs/<timestamp>-<slug>.md` with a small
+header (request, provider, date, and whether it was built) — `archi status` shows
+the last five.
 
 ## Sample output
 
@@ -151,15 +225,33 @@ graph LR
 
 ## How it works
 
-- **`init`** — scans the repo (honoring `.gitignore`, skipping binaries), writes a
-  deterministic `map.md`, sends the key files to the model, and caches its
-  understanding as `profile.md` in `.archi/`.
-- **`design`** — loads the profile + map (plus any `-focus` files) as grounding, then
-  runs the interview, design, review, and build phases against that context. Building
-  parses the model's file blocks and writes them under the repo root.
+- **`init`** — scans the repo (honoring `.gitignore` files, skipping binaries and
+  secret files), writes a deterministic `map.md`, sends the key files to the model,
+  caches its understanding as `profile.md` in `.archi/`, and fingerprints every
+  scanned file (path + size + mtime) so later runs can detect drift with stats alone.
+  `-refresh` updates the profile from just the files that changed.
+- **`design`** — loads the profile + map (plus any `-focus` files) as grounding,
+  warns if the repo drifted from the cache, fits everything into the context budget
+  (`ARCHI_CONTEXT_TOKENS`, default ~48k), then runs the interview, design, review,
+  and build phases against that context. Building parses the model's file blocks and
+  writes them under the repo root.
 
-No magic, no lock-in: the cache is plain Markdown you can read and edit, and generated
-code is written straight to disk with a `.bak` for anything overwritten.
+### Secrets & ignore rules
+
+`archi` never sends obvious secret files: `.env`, `.env.*`, `*.pem`, `*.key`, and
+`id_rsa*` are excluded from the scan entirely. Every file that *is* sent — `init`'s
+key files and `-focus` files — passes through a redactor first, which replaces
+likely credentials (AWS access/secret keys, GitHub / Slack / Stripe tokens, private
+key blocks, `Bearer` headers, and `api_key/secret/token/password = <long value>`
+assignments) with `[REDACTED]` and prints a warning naming each file it touched.
+
+`.gitignore` handling follows git semantics: nested `.gitignore` files in
+subdirectories apply only to paths under their own directory, and deeper files take
+precedence — including `!` negations.
+
+No magic, no lock-in: the cache is plain Markdown you can read and edit, generated
+code is written straight to disk, and anything overwritten is kept in
+`.archi/backups/` for the last 10 runs.
 
 ## License
 

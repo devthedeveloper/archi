@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 )
 
 // stringList collects a repeatable flag (e.g. -focus a -focus b).
@@ -87,12 +88,22 @@ func cmdDesign(args []string) {
 		focusFiles = collectFocus(root, focus)
 	}
 
+	// Staleness is advisory: warn when the repo drifted from the cache, but
+	// design anyway — an approximate profile still beats none.
+	if d, fresh := checkFreshness(root); fresh && !d.empty() {
+		warn("repo has changed since init: " + d.summary() + " — consider " + cyan("archi init -refresh"))
+	}
+
+	// Fit the grounding into the context budget: the profile always ships
+	// whole; the map and focus files shrink or drop to fit.
+	profile, fileMap, fitFocus := fitGrounding(string(profileMD), string(mapMD), focusFiles)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	sess := &session{
 		ctx: ctx, mk: mk, root: root, cfg: cfg,
-		profile: string(profileMD), fileMap: string(mapMD), focus: focusFiles,
+		profile: profile, fileMap: fileMap, focus: fitFocus,
 		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
 	}
 
@@ -106,16 +117,17 @@ func cmdDesign(args []string) {
 
 // session carries everything the design lifecycle needs between phases.
 type session struct {
-	ctx       context.Context
-	mk        providerFactory
-	root      string
-	cfg       *Config
-	profile   string
-	fileMap   string
-	focus     []seedFile
-	maxTokens int
-	yes       bool
-	htmlFile  string
+	ctx         context.Context
+	mk          providerFactory
+	root        string
+	cfg         *Config
+	profile     string
+	fileMap     string
+	focus       []seedFile
+	maxTokens   int
+	yes         bool
+	htmlFile    string
+	historyPath string // where this run's design history entry lives, "" if none
 }
 
 func (s *session) design() Provider { return s.mk(s.maxTokens) }
@@ -155,6 +167,7 @@ func (s *session) runInteractive(request string) {
 	if err != nil {
 		failf("%v", err)
 	}
+	s.recordDesign(request, prov.Name(), doc)
 
 	// Phase 3 — review loop.
 	for {
@@ -173,6 +186,7 @@ func (s *session) runInteractive(request string) {
 			if doc, err = runModel(s.ctx, prov, architectPrompt, reviseUserMessage(doc, ch), os.Stdout, nil); err != nil {
 				failf("%v", err)
 			}
+			s.recordDesign(request, prov.Name(), doc)
 		case "q":
 			qq := readLine("your question:")
 			if qq == "" {
@@ -245,9 +259,22 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 	if outFile != nil {
 		ok("Wrote ~" + humanCount(estimateTokens(doc)) + " tokens → " + outPath)
 	}
+	s.recordDesign(request, prov.Name(), doc)
 	s.maybeHTML(doc)
 	if build {
 		s.buildCode(doc)
+	}
+}
+
+// recordDesign saves (or refreshes) the design in .archi/designs. History is
+// advisory: failures warn and never interrupt the flow.
+func (s *session) recordDesign(request, provider, doc string) {
+	if s.historyPath == "" {
+		s.historyPath = designHistoryPath(s.root, request, time.Now())
+	}
+	if err := writeDesignHistory(s.historyPath, request, provider, time.Now(), false, doc); err != nil {
+		warn("could not save design history: " + err.Error())
+		s.historyPath = ""
 	}
 }
 
@@ -255,6 +282,11 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 // streaming a live per-file view so you can watch each file being written.
 func (s *session) buildCode(design string) {
 	prov := s.builder()
+	if s.historyPath != "" {
+		if err := markDesignBuilt(s.historyPath); err != nil {
+			warn("could not update design history: " + err.Error())
+		}
+	}
 	info("Generating code with " + prov.Name())
 	os.Stderr.WriteString("\n")
 	cs := newCodeStream()
@@ -323,7 +355,7 @@ func collectFocus(root string, globs []string) []seedFile {
 			break
 		}
 		used += t
-		out = append(out, seedFile{rel: f.rel, lang: f.lang, content: string(data)})
+		out = append(out, seedFile{rel: f.rel, lang: f.lang, content: redactForPrompt(f.rel, string(data))})
 	}
 	if len(out) > 0 {
 		info("Focused on " + humanCount(len(out)) + " files (~" + humanCount(used) + " tokens)")

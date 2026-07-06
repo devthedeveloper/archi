@@ -28,6 +28,16 @@ func cmdStatus(args []string) {
 	line("provider", cfg.Provider+"/"+cfg.Model)
 	line("initialized", cfg.InitializedAt)
 	line("files", humanCount(cfg.FileCount)+dim("  ·  ~"+humanCount(cfg.ApproxTokens)+" tokens"))
+	if d, fresh := checkFreshness(root); fresh {
+		v := green("fresh")
+		if !d.empty() {
+			v = yellow(d.summary()) + dim("  ·  run ") + cyan("archi init -refresh")
+		}
+		if age := cacheAge(root); age > 0 {
+			v += dim("  ·  cached " + humanAge(age) + " ago")
+		}
+		line("freshness", v)
+	}
 	os.Stderr.WriteString("\n")
 
 	// Live language bars from the cached totals.
@@ -39,6 +49,18 @@ func cmdStatus(args []string) {
 	}
 	sortLangStats(stats)
 	langBars(stats, total, false)
+
+	if recent := listDesigns(root, 5); len(recent) > 0 {
+		os.Stderr.WriteString("\n")
+		info(bold("Recent designs:"))
+		for _, r := range recent {
+			state := dim("draft")
+			if r.built {
+				state = green("built")
+			}
+			fmt.Fprintf(os.Stderr, "    %s  %-40s %s\n", dim(r.stamp), r.slug, state)
+		}
+	}
 
 	os.Stderr.WriteString("\n")
 	info("Design something:  " + cyan(`archi design "add …"`))

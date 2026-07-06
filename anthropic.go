@@ -31,6 +31,12 @@ func (a *anthropicProvider) Complete(ctx context.Context, system, user string, p
 		return "", errors.New("ANTHROPIC_API_KEY is not set")
 	}
 
+	ctx, cancel, err := requestContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+
 	body, _ := json.Marshal(map[string]any{
 		"model":       a.model,
 		"max_tokens":  a.maxTokens,
@@ -42,15 +48,16 @@ func (a *anthropicProvider) Complete(ctx context.Context, system, user string, p
 		},
 	})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := sharedClient.Do(req)
+	resp, err := doWithRetry(ctx, sharedClient, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		return req, nil
+	})
 	if err != nil {
 		return "", err
 	}
