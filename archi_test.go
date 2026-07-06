@@ -396,7 +396,7 @@ func TestOpenAICompleteRetriesThenStreams(t *testing.T) {
 }
 
 func TestDesignUserMessageStructure(t *testing.T) {
-	msg := designUserMessage("PROFILE-TEXT", "MAP-TEXT", nil, "add caching")
+	msg := designUserMessage("PROFILE-TEXT", "MAP-TEXT", "", nil, "add caching")
 	for _, want := range []string{"CODEBASE PROFILE", "FILE MAP", "CHANGE REQUEST", "PROFILE-TEXT", "add caching"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("design message missing %q", want)
@@ -1611,7 +1611,7 @@ func TestCostLine(t *testing.T) {
 func TestDesignPromptsUnchanged(t *testing.T) {
 	fp := &fakeProvider{out: "doc"}
 	o := &Orchestrator{Trace: nopTrace(), started: time.Now()}
-	userMsg := designUserMessage("PROFILE", "MAP", nil, "add X")
+	userMsg := designUserMessage("PROFILE", "MAP", "", nil, "add X")
 	a := Agent{Spec: AgentSpec{Role: RoleDesigner, System: architectPrompt}, P: fp}
 	o.runStream(context.Background(), a, designTask("add X", userMsg), nil, nil)
 	if fp.gotSystem[0] != architectPrompt {
@@ -1620,4 +1620,498 @@ func TestDesignPromptsUnchanged(t *testing.T) {
 	if fp.gotUser[0] != userMsg {
 		t.Errorf("user message modified on the wire:\n got %q\nwant %q", fp.gotUser[0], userMsg)
 	}
+}
+
+// ── Phase 2: design ensemble ────────────────────────────────────────────────
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func count(xs []string, x string) int {
+	n := 0
+	for _, v := range xs {
+		if v == x {
+			n++
+		}
+	}
+	return n
+}
+
+// vBlock builds a fenced verdict block.
+func vBlock(status string, findings ...string) string {
+	var b strings.Builder
+	b.WriteString("```verdict\nstatus: " + status + "\n")
+	for _, f := range findings {
+		b.WriteString(f + "\n")
+	}
+	b.WriteString("```")
+	return b.String()
+}
+
+// scriptedProvider dispatches on the identified agent role so one provider can
+// script an entire ensemble run, recording call order and per-role prompts.
+type scriptedProvider struct {
+	mu         sync.Mutex
+	fn         func(role, system, user string) (string, error)
+	log        []string
+	userByRole map[string]string
+}
+
+func (p *scriptedProvider) Name() string  { return "scripted/s" }
+func (p *scriptedProvider) Model() string { return "s" }
+
+func (p *scriptedProvider) Complete(ctx context.Context, system, user string, progress io.Writer) (string, error) {
+	role := roleOf(system, user)
+	out, err := p.fn(role, system, user)
+	p.mu.Lock()
+	p.log = append(p.log, role)
+	if p.userByRole == nil {
+		p.userByRole = map[string]string{}
+	}
+	p.userByRole[role] = user
+	p.mu.Unlock()
+	if progress != nil && out != "" {
+		progress.Write([]byte(out))
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return out, err
+}
+
+func roleOf(system, user string) string {
+	switch {
+	case strings.Contains(system, "orienting in an unfamiliar codebase"):
+		return "explorer-pick"
+	case strings.Contains(system, "briefing a software architect"):
+		return "explorer-brief"
+	case strings.Contains(system, "security engineer reviewing"):
+		return "sec"
+	case strings.Contains(system, "over-engineering"):
+		return "simp"
+	case strings.Contains(system, "fact-checker"):
+		return "grnd"
+	case strings.Contains(user, "=== REVIEW FINDINGS ==="):
+		return "revision"
+	default:
+		return "designer"
+	}
+}
+
+func ensembleSession(t *testing.T, root string, cfg *Config, fn func(role, system, user string) (string, error)) (*session, *scriptedProvider) {
+	t.Helper()
+	sp := &scriptedProvider{fn: fn}
+	mk := func(mt int) Provider { return sp }
+	return &session{
+		ctx: context.Background(), mk: mk, criticMk: mk, root: root, cfg: cfg,
+		profile: "PROFILE", fileMap: "FILE MAP",
+		opts: ensembleOpts{mode: "full", rounds: 1},
+		orch: &Orchestrator{Trace: nopTrace(), started: time.Now()},
+	}, sp
+}
+
+func TestParseVerdict(t *testing.T) {
+	t.Run("missing_block", func(t *testing.T) {
+		v, err := parseVerdict("just prose, no verdict")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Status != VerdictAdvisory || len(v.Findings) != 1 || !strings.Contains(v.Findings[0].Title, "no verdict block") {
+			t.Errorf("got %+v", v)
+		}
+	})
+	t.Run("last_block_wins", func(t *testing.T) {
+		s := "```verdict\nstatus: clean\n```\ntext\n```verdict\nstatus: blocking\n- [blocking] X | a.go\n```"
+		v, _ := parseVerdict(s)
+		if v.Status != VerdictBlocking || len(v.Findings) != 1 {
+			t.Errorf("got %+v", v)
+		}
+	})
+	t.Run("status_recomputed", func(t *testing.T) {
+		v, _ := parseVerdict("```verdict\nstatus: clean\n- [blocking] X | a.go\n```")
+		if v.Status != VerdictBlocking {
+			t.Errorf("status should recompute to blocking, got %s", v.Status)
+		}
+	})
+	t.Run("severity_unknown", func(t *testing.T) {
+		v, _ := parseVerdict("```verdict\nstatus: advisory\n- [warning] X | a.go\n```")
+		if v.Findings[0].Severity != VerdictAdvisory {
+			t.Error("unknown severity should be advisory")
+		}
+	})
+	t.Run("paths_split_trim", func(t *testing.T) {
+		v, _ := parseVerdict("```verdict\nstatus: advisory\n- [advisory] X | a.go , b.go,\n- [advisory] Y\n```")
+		if !equalStrings(v.Findings[0].Paths, []string{"a.go", "b.go"}) {
+			t.Errorf("paths: %v", v.Findings[0].Paths)
+		}
+		if v.Findings[1].Paths != nil {
+			t.Errorf("no pipe should give nil paths: %v", v.Findings[1].Paths)
+		}
+	})
+	t.Run("multiline_detail_crlf", func(t *testing.T) {
+		v, _ := parseVerdict("```verdict\r\nstatus: advisory\r\n- [advisory] X | a.go\r\n  line one\r\n  line two\r\n```")
+		if v.Findings[0].Detail != "line one line two" {
+			t.Errorf("detail: %q", v.Findings[0].Detail)
+		}
+	})
+	t.Run("clean_empty", func(t *testing.T) {
+		v, _ := parseVerdict("```verdict\nstatus: clean\n```")
+		if v.Status != VerdictClean || len(v.Findings) != 0 {
+			t.Errorf("got %+v", v)
+		}
+	})
+}
+
+func TestDowngradePathless(t *testing.T) {
+	v := &Verdict{Findings: []Finding{
+		{Severity: VerdictBlocking, Title: "no path"},
+		{Severity: VerdictBlocking, Title: "has path", Paths: []string{"a.go"}},
+	}}
+	v.Status = recomputeStatus(v.Findings)
+	if n := downgradePathless(v); n != 1 {
+		t.Errorf("downgraded %d, want 1", n)
+	}
+	if v.Findings[0].Severity != VerdictAdvisory {
+		t.Error("pathless blocking should become advisory")
+	}
+	if v.Findings[1].Severity != VerdictBlocking {
+		t.Error("path-cited blocking stays blocking")
+	}
+	if v.Status != VerdictBlocking {
+		t.Error("status should stay blocking (one blocking remains)")
+	}
+}
+
+func TestParseFileRequests(t *testing.T) {
+	got := parseFileRequests("prose\n```files\ninternal/a.go\n# comment\ninternal/a.go\ninternal/b.go\n\n```\ntrailing")
+	if !equalStrings(got, []string{"internal/a.go", "internal/b.go"}) {
+		t.Errorf("got %v", got)
+	}
+	var lines strings.Builder
+	lines.WriteString("```files\n")
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(&lines, "f%d.go\n", i)
+	}
+	lines.WriteString("```")
+	if n := len(parseFileRequests(lines.String())); n != maxExplorerFiles {
+		t.Errorf("clamp: got %d, want %d", n, maxExplorerFiles)
+	}
+	if parseFileRequests("no fenced block here") != nil {
+		t.Error("prose-only should return nil")
+	}
+}
+
+func TestReadRequestedFiles(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "real.go"), []byte("package main\nvar Token = \"ghp_"+strings.Repeat("A", 36)+"\"\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "big.go"), []byte(strings.Repeat("x", maxExplorerFileBytes+1)), 0o644)
+	files, dropped := readRequestedFiles(root, []string{"real.go", "missing.go", "big.go"})
+	if dropped != 2 {
+		t.Errorf("dropped=%d, want 2 (missing + oversized)", dropped)
+	}
+	if len(files) != 1 || files[0].rel != "real.go" {
+		t.Fatalf("files=%v", files)
+	}
+	if strings.Contains(files[0].content, "ghp_") {
+		t.Error("token should be redacted")
+	}
+	if !strings.Contains(files[0].content, "REDACTED") {
+		t.Errorf("expected redaction marker in %q", files[0].content)
+	}
+}
+
+func TestExplorerSkipThreshold(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o644)
+	run := func(tokens int) []string {
+		fn := func(role, system, user string) (string, error) {
+			switch role {
+			case "explorer-pick":
+				return "```files\nmain.go\n```", nil
+			case "explorer-brief":
+				return "brief", nil
+			case "designer":
+				return "## Summary\nD\n", nil
+			default:
+				return vBlock("clean"), nil
+			}
+		}
+		sess, sp := ensembleSession(t, root, &Config{ApproxTokens: tokens}, fn)
+		sess.designEnsemble("x", "", nil)
+		return sp.log
+	}
+	if below := run(31999); count(below, "explorer-pick")+count(below, "explorer-brief") != 0 {
+		t.Errorf("below threshold should not call explorer: %v", below)
+	}
+	if above := run(32000); count(above, "explorer-pick") != 1 || count(above, "explorer-brief") != 1 {
+		t.Errorf("at threshold should call explorer twice: %v", above)
+	}
+}
+
+func TestEnsembleHappyPath(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module x\ngo 1.22\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main(){}\n"), 0o644)
+	fn := func(role, system, user string) (string, error) {
+		switch role {
+		case "explorer-pick":
+			return "```files\nmain.go\n```", nil
+		case "explorer-brief":
+			return "## Relevant modules\nmain.go | entry", nil
+		case "designer":
+			return "## Summary\nDraft design targeting main.go.\n", nil
+		case "sec":
+			return vBlock("clean"), nil
+		case "simp":
+			return vBlock("advisory", "- [advisory] Slightly complex | main.go"), nil
+		case "grnd":
+			return vBlock("blocking", "- [blocking] References missing helper | main.go"), nil
+		case "revision":
+			return "## Summary\nRevised design targeting main.go.\n", nil
+		}
+		return "", nil
+	}
+	sess, sp := ensembleSession(t, root, &Config{ApproxTokens: 40000}, fn)
+	doc, err := sess.designEnsemble("add caching", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sp.log) != 7 {
+		t.Fatalf("want 7 calls, got %d: %v", len(sp.log), sp.log)
+	}
+	if sp.log[0] != "explorer-pick" || sp.log[1] != "explorer-brief" || sp.log[2] != "designer" {
+		t.Errorf("prefix wrong: %v", sp.log)
+	}
+	critics := map[string]bool{sp.log[3]: true, sp.log[4]: true, sp.log[5]: true}
+	for _, r := range []string{"sec", "simp", "grnd"} {
+		if !critics[r] {
+			t.Errorf("missing critic %s in %v", r, sp.log)
+		}
+	}
+	if sp.log[6] != "revision" {
+		t.Errorf("last call should be revision: %v", sp.log)
+	}
+	if !strings.Contains(doc, "Revised design") {
+		t.Error("final doc missing revised text")
+	}
+	if !strings.Contains(doc, "## Review notes") {
+		t.Error("final doc missing review notes")
+	}
+	if !strings.Contains(doc, "blocking, addressed in revision") {
+		t.Errorf("notes missing resolved-blocking marker:\n%s", doc)
+	}
+}
+
+func TestEnsembleRounds2(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o644)
+	fn := func(role, system, user string) (string, error) {
+		switch role {
+		case "designer":
+			return "## Summary\nDraft.\n", nil
+		case "revision":
+			return "## Summary\nRevised.\n", nil
+		case "grnd":
+			return vBlock("blocking", "- [blocking] X | main.go"), nil
+		default:
+			return vBlock("clean"), nil
+		}
+	}
+	sess, sp := ensembleSession(t, root, &Config{ApproxTokens: 0}, fn)
+	sess.opts.rounds = 2
+	doc, err := sess.designEnsemble("add X", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := count(sp.log, "grnd"); c != 2 {
+		t.Errorf("want 2 critic passes, got %d: %v", c, sp.log)
+	}
+	if c := count(sp.log, "revision"); c != 2 {
+		t.Errorf("want 2 revisions, got %d", c)
+	}
+	if !strings.Contains(doc, "round 2 of 2") {
+		t.Errorf("notes should report round 2 of 2:\n%s", doc)
+	}
+}
+
+func TestEnsembleCriticFails(t *testing.T) {
+	root := t.TempDir()
+	fn := func(role, system, user string) (string, error) {
+		switch role {
+		case "designer":
+			return "## Summary\nDraft.\n", nil
+		case "sec":
+			return vBlock("clean"), nil
+		case "simp":
+			return vBlock("advisory", "- [advisory] Y | main.go"), nil
+		case "grnd":
+			return "", errors.New("critic boom")
+		}
+		return "", nil
+	}
+	sess, _ := ensembleSession(t, root, &Config{ApproxTokens: 0}, fn)
+	doc, err := sess.designEnsemble("add X", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doc, "grounding critic unavailable") {
+		t.Errorf("notes missing unavailable line:\n%s", doc)
+	}
+	if !strings.Contains(doc, "simplicity · advisory") {
+		t.Errorf("surviving critic should still render:\n%s", doc)
+	}
+}
+
+func TestEnsembleBudgetMidPanel(t *testing.T) {
+	root := t.TempDir()
+	fn := func(role, system, user string) (string, error) {
+		if role == "designer" {
+			return "## Summary\n" + strings.Repeat("x", 4000) + "\n", nil // ~1000 tokens
+		}
+		return vBlock("clean"), nil
+	}
+	sess, _ := ensembleSession(t, root, &Config{ApproxTokens: 0}, fn)
+	sess.orch.RunBudget = 100 // the designer alone exhausts it
+	doc, err := sess.designEnsemble("add X", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doc, "unavailable") {
+		t.Errorf("budget-skipped critics should render unavailable:\n%s", doc)
+	}
+}
+
+func TestEnsembleExplorerFallback(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o644)
+	fn := func(role, system, user string) (string, error) {
+		switch role {
+		case "explorer-pick":
+			return "no files here, just prose", nil // garbage → no requests
+		case "designer":
+			return "## Summary\nDraft.\n", nil
+		default:
+			return vBlock("clean"), nil
+		}
+	}
+	sess, sp := ensembleSession(t, root, &Config{ApproxTokens: 40000}, fn)
+	if _, err := sess.designEnsemble("add X", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if count(sp.log, "explorer-brief") != 0 {
+		t.Errorf("brief step should be skipped on fallback: %v", sp.log)
+	}
+	if strings.Contains(sp.userByRole["designer"], "GROUNDING BRIEF") {
+		t.Error("designer must get classic grounding (no brief) on explorer fallback")
+	}
+}
+
+func TestRenderReviewNotes(t *testing.T) {
+	clean := []AgentResult{
+		{Role: RoleSecCritic, Verdict: &Verdict{Status: VerdictClean}},
+		{Role: RoleSimpCritic, Verdict: &Verdict{Status: VerdictClean}},
+		{Role: RoleGrndCritic, Verdict: &Verdict{Status: VerdictClean}},
+	}
+	got := renderReviewNotes(clean, 1, 1, false)
+	if !strings.Contains(got, "No findings — the panel signed off on the first draft.") {
+		t.Errorf("clean case:\n%s", got)
+	}
+	if !strings.Contains(got, "round 1 of 1") {
+		t.Error("header missing round")
+	}
+
+	mixed := []AgentResult{
+		{Role: RoleSecCritic, Verdict: &Verdict{Status: VerdictAdvisory, Findings: []Finding{{Severity: VerdictAdvisory, Title: "Log hygiene", Detail: "Avoid logging tokens", Paths: []string{"a.go"}}}}},
+		{Role: RoleSimpCritic, Verdict: &Verdict{Status: VerdictBlocking, Findings: []Finding{{Severity: VerdictBlocking, Title: "Too many layers", Paths: []string{"b.go", "c.go"}}}}},
+		{Role: RoleGrndCritic, Err: errRunBudget},
+	}
+	got = renderReviewNotes(mixed, 2, 2, true)
+	for _, want := range []string{
+		"- **security · advisory** — Log hygiene",
+		"  Avoid logging tokens _(a.go)_",
+		"- **simplicity · blocking, addressed in revision** — Too many layers",
+		"  _(b.go, c.go)_",
+		"- _grounding critic unavailable (skipped: run budget exhausted)_",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("mixed missing %q in:\n%s", want, got)
+		}
+	}
+	if got := renderReviewNotes(mixed, 1, 1, false); !strings.Contains(got, "blocking, unresolved") {
+		t.Errorf("unresolved variant:\n%s", got)
+	}
+}
+
+func TestFastModeGolden(t *testing.T) {
+	withBrief := designUserMessage("P", "M", "the brief", nil, "R")
+	noBrief := designUserMessage("P", "M", "", nil, "R")
+	if strings.Contains(noBrief, "GROUNDING BRIEF") {
+		t.Error("empty brief must add nothing (fast mode byte-identical)")
+	}
+	if !strings.Contains(withBrief, "GROUNDING BRIEF (from the explorer)") {
+		t.Error("non-empty brief must be inserted")
+	}
+	if spec, _ := specFor(RoleDesigner); spec.System != architectPrompt {
+		t.Error("designer system prompt must stay architectPrompt")
+	}
+}
+
+func TestEnsembleOptsPrecedence(t *testing.T) {
+	if o := resolveEnsembleOpts(&Config{}, "", "", 0); o.mode != "full" || o.rounds != 1 || o.criticModel != "" {
+		t.Errorf("defaults: %+v", o)
+	}
+	if o := resolveEnsembleOpts(&Config{Agents: "fast", Rounds: 2, CriticModel: "cheap"}, "", "", 0); o.mode != "fast" || o.rounds != 2 || o.criticModel != "cheap" {
+		t.Errorf("config: %+v", o)
+	}
+	if o := resolveEnsembleOpts(&Config{Agents: "fast", Rounds: 2}, "full", "x", 3); o.mode != "full" || o.rounds != 3 || o.criticModel != "x" {
+		t.Errorf("flag override: %+v", o)
+	}
+	if o := resolveEnsembleOpts(&Config{}, "", "", 9); o.rounds != 3 {
+		t.Errorf("rounds clamp: %d", o.rounds)
+	}
+
+	root := t.TempDir()
+	os.MkdirAll(archiDir(root), 0o755)
+	cfg := &Config{}
+	persistEnsembleFlags(cfg, root, true, false, true, "off", "", 2)
+	loaded, err := loadConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Agents != "off" || loaded.Rounds != 2 {
+		t.Errorf("persisted: %+v", loaded)
+	}
+	if loaded.CriticModel != "" {
+		t.Error("critic-model not passed → should not persist")
+	}
+
+	// A save failure warns and does not panic.
+	root2 := t.TempDir()
+	os.WriteFile(archiDir(root2), []byte("not a dir"), 0o644)
+	persistEnsembleFlags(&Config{}, root2, true, false, false, "fast", "", 0)
+}
+
+func TestRevisionUserMessage(t *testing.T) {
+	got := revisionUserMessage("THE DESIGN", "THE VERDICTS")
+	for _, want := range []string{"=== CURRENT DESIGN ===", "THE DESIGN", "=== REVIEW FINDINGS ===", "THE VERDICTS", "resolve every blocking finding", "Trade-off:"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
+
+func TestGroundingCriticEval(t *testing.T) {
+	if os.Getenv("ARCHI_EVAL") != "1" {
+		t.Skip("set ARCHI_EVAL=1 with provider creds to run the grounding-critic eval")
+	}
+	t.Skip("eval harness requires a live provider; not run in unit tests")
 }

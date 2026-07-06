@@ -11,7 +11,7 @@ import (
 
 // version is the release version; goreleaser overrides it at build time via
 // -ldflags "-X main.version=...".
-var version = "1.3.0"
+var version = "1.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -106,5 +106,8 @@ func designUsage() {
   -temp float        sampling temperature (default 0.4)
   -max-tokens int    max output tokens for the design (default 8000)
   -no-stream         wait for the full response instead of streaming
+  -agents string     ensemble mode: full (explorer + critics), fast (single call), off (reserved)
+  -critic-model string  cheaper model for the critic panel (default: the design model)
+  -rounds int        designer-critic debate rounds, 1-3 (default 1)
 `)
 }

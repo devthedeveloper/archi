@@ -19,6 +19,11 @@ type Config struct {
 	Languages     map[string]int `json:"languages"`
 	FileCount     int            `json:"fileCount"`
 	ApproxTokens  int            `json:"approxTokens"`
+
+	// Ensemble settings, persisted only when the matching flag is passed.
+	Agents      string `json:"agents,omitempty"`      // "full" | "fast" | "off"
+	CriticModel string `json:"criticModel,omitempty"` // cheaper model for critics
+	Rounds      int    `json:"rounds,omitempty"`      // designer↔critic debate rounds
 }
 
 func archiDir(root string) string     { return filepath.Join(root, archiDirName) }

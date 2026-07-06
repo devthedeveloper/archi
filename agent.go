@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -115,11 +116,12 @@ func renderSystem(spec AgentSpec, in TaskInput) (string, error) {
 }
 
 // agentUserMessage assembles the user message for an agent call. When
-// in.Extra["user_message"] is set it is returned verbatim — the Phase 1 escape
-// hatch that lets cmd_design keep its existing prompt-builder output
-// byte-identical. Otherwise a generic assembly is produced for later phases:
-// one "=== <UPPERCASED PART NAME> ===" section per Grounding part (in order),
-// then "=== INTERVIEW ===" when Interview != "", then "=== REQUEST ===".
+// in.Extra["user_message"] is set it is returned verbatim — the escape hatch
+// that lets cmd_design keep its existing prompt-builder output byte-identical.
+// Otherwise a generic assembly is produced: one "=== <UPPERCASED PART NAME>
+// ===" section per Grounding part (in order), then "=== INTERVIEW ===" when
+// Interview != "", then one section per Extra payload (sorted by key, the
+// user_message hatch excluded), then "=== REQUEST ===".
 func agentUserMessage(in TaskInput) string {
 	if in.Extra != nil {
 		if m, ok := in.Extra["user_message"]; ok {
@@ -136,6 +138,20 @@ func agentUserMessage(in TaskInput) string {
 		b.WriteString("=== INTERVIEW ===\n\n")
 		b.WriteString(in.Interview)
 		b.WriteString("\n\n")
+	}
+	if len(in.Extra) > 0 {
+		keys := make([]string, 0, len(in.Extra))
+		for k := range in.Extra {
+			if k != "user_message" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			b.WriteString("=== " + strings.ToUpper(k) + " ===\n\n")
+			b.WriteString(in.Extra[k])
+			b.WriteString("\n\n")
+		}
 	}
 	b.WriteString("=== REQUEST ===\n\n")
 	b.WriteString(in.Request)

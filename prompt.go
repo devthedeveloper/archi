@@ -148,13 +148,20 @@ func refreshUserMessage(profileMD, mapMD, drift string, changed []seedFile, remo
 	return b.String()
 }
 
-// designUserMessage assembles the design request: profile, map, focus files, task.
-func designUserMessage(profileMD, mapMD string, focus []seedFile, request string) string {
+// designUserMessage assembles the design request: profile, map, an optional
+// explorer brief, focus files, and the task. A "" brief is omitted entirely, so
+// fast-mode output stays byte-identical to before the brief was added.
+func designUserMessage(profileMD, mapMD, brief string, focus []seedFile, request string) string {
 	var b strings.Builder
 	b.WriteString("=== CODEBASE PROFILE ===\n\n")
 	b.WriteString(profileMD)
 	b.WriteString("\n\n=== FILE MAP ===\n\n")
 	b.WriteString(mapMD)
+	if brief != "" {
+		b.WriteString("\n=== GROUNDING BRIEF (from the explorer) ===\n\n")
+		b.WriteString(brief)
+		b.WriteString("\n")
+	}
 	if len(focus) > 0 {
 		b.WriteString("\n=== FOCUS FILES ===\n")
 		b.WriteString(fenceFiles(focus))
@@ -214,7 +221,7 @@ changes minimal and idiomatic. Include any new tests the design calls for.`
 
 // clarifyUserMessage assembles the interview request.
 func clarifyUserMessage(profileMD, mapMD string, focus []seedFile, request string) string {
-	return designUserMessage(profileMD, mapMD, focus, request) + "\n\nAsk your clarifying questions now, in the required block format."
+	return designUserMessage(profileMD, mapMD, "", focus, request) + "\n\nAsk your clarifying questions now, in the required block format."
 }
 
 // reviseUserMessage asks the model to revise a design given requested changes.
@@ -222,6 +229,18 @@ func reviseUserMessage(design, changes string) string {
 	return "=== CURRENT DESIGN ===\n\n" + design +
 		"\n\n=== REQUESTED CHANGES ===\n\n" + changes +
 		"\n\nOutput the FULL revised design document, same section structure, incorporating the changes."
+}
+
+// revisionUserMessage asks the designer to revise a design against critic
+// findings — resolving blockers or arguing back in a Trade-off note.
+func revisionUserMessage(design, verdicts string) string {
+	return "=== CURRENT DESIGN ===\n\n" + design +
+		"\n\n=== REVIEW FINDINGS ===\n\n" + verdicts +
+		"\n\nRevise the design to resolve every blocking finding. For any blocking finding you" +
+		"\ndisagree with, keep the design as is and argue against it in a short \"Trade-off:\"" +
+		"\nnote inside the relevant section. Fold in advisory findings where they improve the" +
+		"\ndesign; otherwise ignore them. Output the FULL revised design document, same section" +
+		"\nstructure. Do not mention the reviewers or this revision process."
 }
 
 // questionUserMessage assembles a question about the current design.

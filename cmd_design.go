@@ -36,6 +36,9 @@ func cmdDesign(args []string) {
 	build := fs.Bool("build", false, "after designing, generate the code (non-interactive)")
 	yes := fs.Bool("yes", false, "auto-approve writing generated files")
 	noStream := fs.Bool("no-stream", false, "wait for the full response instead of streaming")
+	agents := fs.String("agents", "", "ensemble mode: full, fast, or off (default: from .archi, else full)")
+	criticModel := fs.String("critic-model", "", "cheaper model for critics (default: the design model)")
+	rounds := fs.Int("rounds", 0, "designer↔critic debate rounds, 1-3 (default: from .archi, else 1)")
 	fs.Usage = func() { designUsage() }
 	fs.Parse(args)
 
@@ -75,6 +78,31 @@ func cmdDesign(args []string) {
 		return p
 	}
 
+	// Resolve ensemble options (flag > config > default) and persist any flag
+	// the user explicitly set, so it becomes the default next run.
+	opts := resolveEnsembleOpts(cfg, *agents, *criticModel, *rounds)
+	setA, setC, setR := false, false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "agents":
+			setA = true
+		case "critic-model":
+			setC = true
+		case "rounds":
+			setR = true
+		}
+	})
+	persistEnsembleFlags(cfg, root, setA, setC, setR, *agents, *criticModel, *rounds)
+	// Critics run at temperature 0, on their own model when -critic-model is set.
+	criticMk := func(mt int) Provider {
+		cm := opts.criticModel
+		if cm == "" {
+			cm = pModel
+		}
+		p, _ := newProvider(pName, cm, 0, mt)
+		return p
+	}
+
 	mapMD, err := os.ReadFile(mapPath(root))
 	if err != nil {
 		failf("reading map: %v (try %s)", err, cyan("archi init -force"))
@@ -105,6 +133,7 @@ func cmdDesign(args []string) {
 		ctx: ctx, mk: mk, root: root, cfg: cfg,
 		profile: profile, fileMap: fileMap, focus: fitFocus,
 		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
+		opts: opts, criticMk: criticMk,
 	}
 	sess.orch = newOrchestrator(root)
 
@@ -130,6 +159,8 @@ type session struct {
 	htmlFile    string
 	historyPath string        // where this run's design history entry lives, "" if none
 	orch        *Orchestrator // agent runtime: traces every call, charges the run budget
+	opts        ensembleOpts  // resolved -agents/-critic-model/-rounds
+	criticMk    providerFactory
 }
 
 // agentFor binds a registered spec to the session's provider for that role
@@ -186,20 +217,27 @@ func (s *session) runInteractive(request string) {
 	sp.Stop("Questions ready")
 	answers := askQuestions(parseQuestions(res.Output))
 
-	req := request
-	if answers != "" {
-		req = request + "\n\nClarifications from the requester:\n" + answers
+	// Phase 2 — design. Full mode runs the ensemble; fast/off is byte-identical.
+	var doc string
+	if s.opts.mode == "full" {
+		var derr error
+		if doc, derr = s.designEnsemble(request, answers, os.Stdout); derr != nil {
+			failf("%v", derr)
+		}
+	} else {
+		req := request
+		if answers != "" {
+			req = request + "\n\nClarifications from the requester:\n" + answers
+		}
+		info("Designing …")
+		os.Stderr.WriteString("\n")
+		res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
+			designTask(request, designUserMessage(s.profile, s.fileMap, "", s.focus, req)), os.Stdout, nil)
+		if res.Err != nil {
+			failf("%v", res.Err)
+		}
+		doc = res.Output
 	}
-
-	// Phase 2 — design (streamed live).
-	info("Designing …")
-	os.Stderr.WriteString("\n")
-	res = s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
-		designTask(request, designUserMessage(s.profile, s.fileMap, s.focus, req)), os.Stdout, nil)
-	if res.Err != nil {
-		failf("%v", res.Err)
-	}
-	doc := res.Output
 	s.recordDesign(request, prov.Name(), doc)
 
 	// Phase 3 — review loop.
@@ -276,26 +314,43 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 	banner()
 	info("Designing with " + prov.Name())
 
-	task := designTask(request, designUserMessage(s.profile, s.fileMap, s.focus, request))
 	var doc string
-	if live {
-		os.Stderr.WriteString("\n")
-		res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, os.Stdout, nil)
-		if res.Err != nil {
-			failf("%v", res.Err)
+	if s.opts.mode == "full" {
+		var liveW io.Writer
+		if live {
+			liveW = os.Stdout
+			os.Stderr.WriteString("\n")
 		}
-		doc = res.Output
+		var derr error
+		if doc, derr = s.designEnsemble(request, "", liveW); derr != nil {
+			failf("%v", derr)
+		}
+		if !live {
+			if _, err := io.WriteString(target, doc); err != nil {
+				failf("%v", err)
+			}
+		}
 	} else {
-		sp := startSpinner("Designing")
-		res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, nil, sp)
-		if res.Err != nil {
-			sp.Abort()
-			failf("%v", res.Err)
-		}
-		sp.Stop("Design ready")
-		doc = res.Output
-		if _, err := io.WriteString(target, doc); err != nil {
-			failf("%v", err)
+		task := designTask(request, designUserMessage(s.profile, s.fileMap, "", s.focus, request))
+		if live {
+			os.Stderr.WriteString("\n")
+			res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, os.Stdout, nil)
+			if res.Err != nil {
+				failf("%v", res.Err)
+			}
+			doc = res.Output
+		} else {
+			sp := startSpinner("Designing")
+			res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""), task, nil, sp)
+			if res.Err != nil {
+				sp.Abort()
+				failf("%v", res.Err)
+			}
+			sp.Stop("Design ready")
+			doc = res.Output
+			if _, err := io.WriteString(target, doc); err != nil {
+				failf("%v", err)
+			}
 		}
 	}
 	if outFile != nil {
