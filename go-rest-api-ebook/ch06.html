@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · Users &amp; Passwords — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch05.html">← Ch 5 · Database</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch07.html">Ch 7 · Login &amp; Tokens →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#ffd9e9"><small>chapter</small><span>6</span></div>
+  <div>
+    <h1>Users &amp; Passwords</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#e94f8a" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">bcrypt, fields that can never leak, and gopherit's first real endpoint</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>why passwords are <i>hashed</i>, never encrypted, never stored</li>
+    <li><code>json:"-"</code> — the tag that makes leaks impossible</li>
+    <li>INSERT … RETURNING, and catching UNIQUE violations cleanly</li>
+    <li>the full register endpoint: validate → hash → insert → 201</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">The one rule you never break</span></h2>
+
+<div class="box warn">
+  <span class="box-title">Repeat after me</span>
+  <p><span class="hl p">We never store the password. Not encrypted. Not “just for debugging”.
+  Never.</span> We store a <b>hash</b> — a one-way fingerprint. Login re-hashes whatever the user
+  typed and compares fingerprints. If our database leaks, attackers get fingerprints, not keys.</p>
+</div>
+
+<p>Not any hash, though. Fast hashes (SHA-256, MD5) can be guessed at
+<em>billions per second</em> on a GPU. Password hashing uses deliberately slow, salted algorithms.
+We use <strong>bcrypt</strong> — battle-tested since 1999 and one import away:</p>
+
+<div class="code-card"><span class="filename">the whole bcrypt API we need</span>
+<pre><code class="lang-go">import "golang.org/x/crypto/bcrypt"
+
+// registering: plaintext -> hash (cost 12 ≈ a quarter second, on purpose)
+hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+
+// logging in: does this attempt match the stored hash?
+err = bcrypt.CompareHashAndPassword(storedHash, []byte(attempt))
+// err == nil        -> correct password
+// err != nil        -> wrong password (or corrupted hash)</code></pre>
+</div>
+
+<ul>
+  <li><strong>Salted automatically:</strong> bcrypt mixes random bytes into every hash, so two users
+      with the same password get different hashes, and rainbow tables are useless.</li>
+  <li><strong>Slow on purpose:</strong> cost 12 means ~250ms per attempt. A user won't notice at
+      login; someone guessing millions of passwords absolutely will.</li>
+  <li><strong>72-byte input limit:</strong> that's why our validation caps passwords at 72 chars.</li>
+</ul>
+
+<h2><span class="swipe teal">The User model — with a tamper-proof pocket</span></h2>
+
+<div class="code-card"><span class="filename new">internal/store/users.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/users.go">package store
+
+import (
+	"database/sql"
+	"errors"
+)
+
+// User is an account on gopherit. PasswordHash is tagged json:"-" so it
+// can NEVER leak into an API response, even by accident.
+type User struct {
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	Email        string `json:"email"`
+	CreatedAt    string `json:"created_at"`
+	PasswordHash []byte `json:"-"`
+}
+
+// CreateUser inserts a new user and returns the stored row.
+// Returns ErrDuplicate when the username or email is already taken.
+func (s *Store) CreateUser(username, email string, passwordHash []byte) (*User, error) {
+	var u User
+	err := s.db.QueryRow(`
+        INSERT INTO users (username, email, password_hash)
+        VALUES (?, ?, ?)
+        RETURNING id, username, email, created_at`,
+		username, email, passwordHash,
+	).Scan(&amp;u.ID, &amp;u.Username, &amp;u.Email, &amp;u.CreatedAt)
+
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicate
+		}
+		return nil, err
+	}
+	return &amp;u, nil
+}
+
+// UserByEmail fetches a user (including the password hash, for login).
+// Returns ErrNotFound when no such account exists.
+func (s *Store) UserByEmail(email string) (*User, error) {
+	var u User
+	err := s.db.QueryRow(`
+        SELECT id, username, email, created_at, password_hash
+        FROM users
+        WHERE email = ?`,
+		email,
+	).Scan(&amp;u.ID, &amp;u.Username, &amp;u.Email, &amp;u.CreatedAt, &amp;u.PasswordHash)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &amp;u, nil
+}</code></pre>
+</div>
+
+<p>Details worth savoring:</p>
+<ul>
+  <li><span class="hl y"><code>PasswordHash []byte `json:"-"`</code></span> — the dash tells
+      <code>encoding/json</code>: this field does not exist as far as you're concerned. Even if a
+      future you writes <code>writeJSON(w, 200, envelope{"user": user})</code> at 3 a.m., the hash
+      <em>cannot</em> end up in a response. Guardrails beat vigilance.</li>
+  <li><strong>RETURNING</strong> — one round trip inserts the row <em>and</em> hands back the
+      DB-generated bits (<code>id</code>, <code>created_at</code>). No “insert then select” dance.</li>
+  <li><strong>isUniqueViolation → ErrDuplicate</strong> — remember the sentinel-error vocabulary:
+      the store reports “duplicate”, and the handler decides that means HTTP 409.</li>
+</ul>
+
+<h2><span class="swipe pink">The register handler</span></h2>
+
+<div class="code-card"><span class="filename new">cmd/api/users.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/users.go#func registerUserHandler">// registerUserHandler — POST /api/v1/users
+// Body: {"username": "...", "email": "...", "password": "..."}
+func (app *application) registerUserHandler(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	input.Username = strings.TrimSpace(input.Username)
+	input.Email = strings.TrimSpace(strings.ToLower(input.Email))
+
+	p := make(problems)
+	p.check(len(input.Username) &gt;= 3, "username", "must be at least 3 characters")
+	p.check(len(input.Username) &lt;= 30, "username", "must be at most 30 characters")
+	p.check(!strings.ContainsAny(input.Username, " \t\n"), "username", "must not contain spaces")
+	p.check(strings.Count(input.Email, "@") == 1, "email", "must be a valid email address")
+	p.check(len(input.Password) &gt;= 8, "password", "must be at least 8 characters")
+	p.check(len(input.Password) &lt;= 72, "password", "must be at most 72 characters")
+	if len(p) &gt; 0 {
+		app.failedValidation(w, p)
+		return
+	}
+
+	// bcrypt: slow on purpose, salted automatically. Cost 12 ≈ 250ms.
+	hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), 12)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	user, err := app.store.CreateUser(input.Username, input.Email, hash)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDuplicate):
+			app.conflict(w, "a user with this username or email already exists")
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	app.writeJSON(w, http.StatusCreated, envelope{"user": user})
+}</code></pre>
+</div>
+
+<p>Every mutating handler in gopherit follows this exact rhythm — learn it once, reuse it eleven
+times:</p>
+
+<div class="flow">
+  <div class="node b">read<small>readJSON → 400</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node v">validate<small>problems → 422</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node t">store call<small>sentinels → 409/404</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node g">respond<small>writeJSON → 201</small></div>
+</div>
+
+<div class="box tip">
+  <span class="box-title">The anonymous input struct</span>
+  <p>Notice <code>var input struct{...}</code> declared <em>inside</em> the handler. The JSON a
+  client sends (with a password!) and the struct we store are different shapes — separate types
+  keep them from bleeding into each other. Inline structs are perfect for use-once request
+  shapes.</p>
+</div>
+
+<p>Register the route (one new line in <code>routes.go</code>) and it's live:</p>
+
+<div class="code-card"><span class="filename">cmd/api/routes.go — add</span>
+<pre><code class="lang-go">mux.HandleFunc("POST /api/v1/users", app.registerUserHandler)</code></pre>
+</div>
+
+<h2><span class="swipe green">Kick the tires</span></h2>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># the happy path — note the 201 and NO password anywhere in the reply:
+$ curl -s -X POST localhost:4000/api/v1/users \
+    -d '{"username":"ada","email":"ada@example.com","password":"correct-horse-battery"}'
+{
+	"user": {
+		"id": 1,
+		"username": "ada",
+		"email": "ada@example.com",
+		"created_at": "2026-07-07T15:35:44Z"
+	}
+}
+
+# everything wrong at once — one 422, all the problems:
+$ curl -s -i -X POST localhost:4000/api/v1/users \
+    -d '{"username":"x","email":"nope","password":"123"}'
+HTTP/1.1 422 Unprocessable Entity
+
+{
+	"error": {
+		"email": "must be a valid email address",
+		"password": "must be at least 8 characters",
+		"username": "must be at least 3 characters"
+	}
+}
+
+# same username again — the UNIQUE constraint speaks:
+$ curl -s -X POST localhost:4000/api/v1/users \
+    -d '{"username":"ada","email":"ada@example.com","password":"correct-horse-battery"}'
+{
+	"error": "a user with this username or email already exists"
+}</code></pre>
+</div>
+
+<span class="scribble o">open gopherit.db in a DB browser — there's ada, and her password_hash is gibberish. 🎉</span>
+
+<div class="box deep">
+  <span class="box-title">Why is email validation just “count the @”?</span>
+  <p>Full RFC-5322 email validation is a famous rabbit hole (the “correct” regex is two pages
+  long, and still can't tell you the inbox <em>exists</em>). Real apps validate by sending a
+  confirmation link. For gopherit, “exactly one @, trimmed, lower-cased” filters out the honest
+  mistakes — good enough, honest about it.</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Store bcrypt hashes, never passwords. Cost 12. Compare with CompareHashAndPassword.</li>
+  <li><code>json:"-"</code> makes leaking a field structurally impossible.</li>
+  <li>INSERT … RETURNING = create and read back in one query.</li>
+  <li>Handler rhythm: read → validate → store → respond. 400/422/409/201.</li>
+  <li>Request structs and storage structs are different types — keep them separate.</li>
+</ul>
+<p><b>Next up:</b> ada exists, but the server forgets her the moment the request ends. Time to
+mint login tokens.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch05.html">← Ch 5 · Database</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch07.html">Ch 7 · Login &amp; Tokens →</a>
+</nav>
+
+</div>
+</body>
+</html>

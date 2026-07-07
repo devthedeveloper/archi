@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Go + REST — Build Your Own Reddit · a handwritten ebook</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+  <!-- ============ COVER ============ -->
+  <div style="text-align:center;padding:24px 0 8px">
+    <svg width="150" height="150" viewBox="0 0 120 120" aria-label="a hand-drawn gopher" style="transform:rotate(-4deg)">
+      <!-- ears -->
+      <circle cx="30" cy="22" r="12" fill="#7ad2e2" stroke="#333047" stroke-width="3"/>
+      <circle cx="90" cy="22" r="12" fill="#7ad2e2" stroke="#333047" stroke-width="3"/>
+      <circle cx="30" cy="22" r="5" fill="#f8e3c9"/>
+      <circle cx="90" cy="22" r="5" fill="#f8e3c9"/>
+      <!-- body -->
+      <rect x="18" y="14" width="84" height="98" rx="40" fill="#7ad2e2" stroke="#333047" stroke-width="3"/>
+      <!-- eyes -->
+      <circle cx="43" cy="47" r="15" fill="#fff" stroke="#333047" stroke-width="2.5"/>
+      <circle cx="77" cy="47" r="15" fill="#fff" stroke="#333047" stroke-width="2.5"/>
+      <circle cx="47" cy="50" r="5" fill="#333047"/>
+      <circle cx="73" cy="50" r="5" fill="#333047"/>
+      <!-- snout -->
+      <ellipse cx="60" cy="66" rx="9" ry="7" fill="#f8e3c9" stroke="#333047" stroke-width="2.5"/>
+      <ellipse cx="60" cy="61" rx="4.5" ry="3.5" fill="#8a5a3b" stroke="#333047" stroke-width="2"/>
+      <!-- teeth -->
+      <rect x="55" y="71" width="10" height="8" rx="2" fill="#fff" stroke="#333047" stroke-width="2"/>
+      <line x1="60" y1="71" x2="60" y2="79" stroke="#333047" stroke-width="1.5"/>
+      <!-- paws -->
+      <ellipse cx="38" cy="100" rx="9" ry="6" fill="#f8e3c9" stroke="#333047" stroke-width="2.5"/>
+      <ellipse cx="82" cy="100" rx="9" ry="6" fill="#f8e3c9" stroke="#333047" stroke-width="2.5"/>
+    </svg>
+
+    <h1 class="cover-title"><span class="go">Go</span> + <span class="rest">REST</span><br>Build Your Own Reddit</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" style="margin:0 auto" aria-hidden="true">
+      <path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#ff5722" stroke-width="4" stroke-linecap="round"/>
+    </svg>
+    <p class="cover-sub">a colorful, handwritten-notes ebook about building real REST APIs in Go —<br>by writing the whole backend of a Reddit clone, one page at a time</p>
+
+    <p style="margin-top:18px">
+      <span class="hl y">backend only</span> &nbsp;·&nbsp;
+      <span class="hl b">any frontend can plug in</span> &nbsp;·&nbsp;
+      <span class="hl g">standard library first</span> &nbsp;·&nbsp;
+      <span class="hl p">every line tested &amp; runnable</span>
+    </p>
+  </div>
+
+  <!-- ============ WHAT WE'RE BUILDING ============ -->
+  <h2><span class="swipe">What you'll have built by the last page</span></h2>
+  <p>A complete, working Reddit-clone API called <strong class="pen-o">gopherit</strong>. Users register and
+  log in, create communities (subreddits), submit text &amp; link posts, write nested comment threads,
+  and upvote / downvote everything — with hot/new/top feeds, pagination, auth, CORS and tests.
+  It speaks pure JSON over HTTP, so <span class="hl y">anyone can bolt a React, Vue, Flutter or
+  terminal frontend onto it</span> and have their own Reddit.</p>
+
+  <div class="flow" aria-label="architecture overview">
+    <div class="node b">any frontend<small>browser · mobile · curl</small></div>
+    <div class="arrow">⟶</div>
+    <div class="node o">JSON over HTTP<small>the REST API</small></div>
+    <div class="arrow">⟶</div>
+    <div class="node v">handlers<small>cmd/api</small></div>
+    <div class="arrow">⟶</div>
+    <div class="node t">store<small>internal/store</small></div>
+    <div class="arrow">⟶</div>
+    <div class="node g">SQLite<small>one little file</small></div>
+  </div>
+
+  <div class="box cheat">
+    <span class="box-title">The whole API on one page</span>
+    <div class="tbl-scroll">
+    <table class="notes">
+      <tr><th>Endpoint</th><th>What it does</th><th>Chapter</th></tr>
+      <tr><td><span class="ep get">GET /api/v1/healthz</span></td><td>is the server alive?</td><td><a href="ch02.html">2</a>–<a href="ch04.html">4</a></td></tr>
+      <tr><td><span class="ep post">POST /api/v1/users</span></td><td>register an account</td><td><a href="ch06.html">6</a></td></tr>
+      <tr><td><span class="ep post">POST /api/v1/tokens</span></td><td>log in → bearer token</td><td><a href="ch07.html">7</a></td></tr>
+      <tr><td><span class="ep get">GET /api/v1/subreddits</span></td><td>list communities</td><td><a href="ch09.html">9</a></td></tr>
+      <tr><td><span class="ep post lock">POST /api/v1/subreddits</span></td><td>create a community</td><td><a href="ch09.html">9</a></td></tr>
+      <tr><td><span class="ep get">GET /api/v1/subreddits/{name}</span></td><td>one community</td><td><a href="ch09.html">9</a></td></tr>
+      <tr><td><span class="ep get">GET /api/v1/subreddits/{name}/posts</span></td><td>community feed</td><td><a href="ch10.html">10</a></td></tr>
+      <tr><td><span class="ep get">GET /api/v1/posts</span></td><td>front page (hot/new/top + pages)</td><td><a href="ch10.html">10</a></td></tr>
+      <tr><td><span class="ep post lock">POST /api/v1/posts</span></td><td>submit a text or link post</td><td><a href="ch10.html">10</a></td></tr>
+      <tr><td><span class="ep get">GET /api/v1/posts/{id}</span></td><td>post + nested comment tree</td><td><a href="ch10.html">10</a>–<a href="ch11.html">11</a></td></tr>
+      <tr><td><span class="ep post lock">POST /api/v1/posts/{id}/comments</span></td><td>comment or reply</td><td><a href="ch11.html">11</a></td></tr>
+      <tr><td><span class="ep post lock">POST /api/v1/posts/{id}/vote</span></td><td>upvote / downvote a post</td><td><a href="ch11.html">11</a></td></tr>
+      <tr><td><span class="ep post lock">POST /api/v1/comments/{id}/vote</span></td><td>vote on a comment</td><td><a href="ch11.html">11</a></td></tr>
+    </table>
+    </div>
+    <p style="font-size:16px">🔒 = needs a login token. The finished, tested source lives in
+    <a href="code/gopherit/">code/gopherit/</a> — but you'll write every line yourself along the way.</p>
+  </div>
+
+  <!-- ============ TOC ============ -->
+  <h2><span class="swipe teal">The chapters</span></h2>
+  <div class="toc-grid">
+    <a class="toc-card" href="ch01.html">
+      <span class="num">chapter 01</span>
+      <span class="name">The Game Plan</span>
+      <span class="blurb">What REST actually is, how HTTP works under the hood, and the map of everything we're about to build.</span>
+    </a>
+    <a class="toc-card" href="ch02.html">
+      <span class="num">chapter 02</span>
+      <span class="name">Hello, HTTP</span>
+      <span class="blurb">Your first Go web server in 15 lines. Handlers, the router, path parameters — no frameworks, ever.</span>
+    </a>
+    <a class="toc-card" href="ch03.html">
+      <span class="num">chapter 03</span>
+      <span class="name">A Real Project Skeleton</span>
+      <span class="blurb">cmd/ and internal/, the application struct, dependency injection without magic, flags and structured logs.</span>
+    </a>
+    <a class="toc-card" href="ch04.html">
+      <span class="num">chapter 04</span>
+      <span class="name">Speaking JSON</span>
+      <span class="blurb">Bullet-proof readJSON &amp; writeJSON helpers, response envelopes, friendly errors and a tiny validator.</span>
+    </a>
+    <a class="toc-card" href="ch05.html">
+      <span class="num">chapter 05</span>
+      <span class="name">A Database in a File</span>
+      <span class="blurb">SQLite with zero C compilers, database/sql, and the six-table schema behind every Reddit ever.</span>
+    </a>
+    <a class="toc-card" href="ch06.html">
+      <span class="num">chapter 06</span>
+      <span class="name">Users &amp; Passwords</span>
+      <span class="blurb">bcrypt hashing, hiding fields from JSON forever, and the register endpoint with real validation.</span>
+    </a>
+    <a class="toc-card" href="ch07.html">
+      <span class="num">chapter 07</span>
+      <span class="name">Login &amp; Tokens</span>
+      <span class="blurb">Stateful bearer tokens: mint them, hash them, expire them. Plus: why we didn't reach for JWT.</span>
+    </a>
+    <a class="toc-card" href="ch08.html">
+      <span class="num">chapter 08</span>
+      <span class="name">Middleware: the Onion</span>
+      <span class="blurb">Panic recovery, request logging, CORS for your future frontend, and auth via request context.</span>
+    </a>
+    <a class="toc-card" href="ch09.html">
+      <span class="num">chapter 09</span>
+      <span class="name">Subreddits</span>
+      <span class="blurb">Your first full resource: create + read endpoints, slug validation, 409 conflicts, Location headers.</span>
+    </a>
+    <a class="toc-card" href="ch10.html">
+      <span class="num">chapter 10</span>
+      <span class="name">Posts &amp; Feeds</span>
+      <span class="blurb">Text vs link posts, pagination with metadata, and the “hot” ranking formula — with the math explained.</span>
+    </a>
+    <a class="toc-card" href="ch11.html">
+      <span class="num">chapter 11</span>
+      <span class="name">Comments &amp; Votes</span>
+      <span class="blurb">Nested comment trees built in O(n), vote upserts with ON CONFLICT, and transactions that keep scores honest.</span>
+    </a>
+    <a class="toc-card" href="ch12.html">
+      <span class="num">chapter 12</span>
+      <span class="name">Polish, Test, Ship</span>
+      <span class="blurb">Graceful shutdown, real httptest integration tests, a production binary, Docker, and where to go next.</span>
+    </a>
+  </div>
+
+  <!-- ============ HOW TO USE ============ -->
+  <h2><span class="swipe pink">How to read this book</span></h2>
+  <ul class="checklist">
+    <li><strong>Type the code.</strong> Every chapter builds one piece of gopherit. Copy-paste works,
+      but your fingers learn faster than your eyes.</li>
+    <li><strong>Run everything.</strong> Each chapter ends with real <code>curl</code> commands and the
+      exact output you should see — taped in from a live run of the finished server.</li>
+    <li><strong>Read the sticky notes.</strong> Yellow = remember this. The dashed boxes are tips 💡,
+      warnings ⚠️, traps 🪤 and deep dives 🤿 — skippable, but tasty.</li>
+    <li><strong>Stuck?</strong> The finished project is in <a href="code/gopherit/">code/gopherit/</a>,
+      compiles cleanly, and passes its test suite. Diff your code against it.</li>
+  </ul>
+
+  <div class="sticky blue">
+    <h4>Before you start, you need…</h4>
+    <ul>
+      <li><b>Go 1.24+</b> installed — check with <code>go version</code></li>
+      <li>a terminal with <code>curl</code> (or any API client)</li>
+      <li>basic Go syntax: variables, structs, functions, errors.
+          Rusty? Keep the <a href="https://github.com/devthedeveloper/gocheatsheet">gocheatsheet</a> open in the next tab — this book was written to be its companion. 📑</li>
+    </ul>
+  </div>
+
+  <span class="scribble o">No frameworks. No ORMs. No magic. Just Go's standard library, one tiny SQLite driver, and bcrypt. ✍️</span>
+
+  <nav class="booknav bottom">
+    <span></span>
+    <a href="ch01.html">Start reading → Ch 1 · The Game Plan</a>
+  </nav>
+</div>
+</body>
+</html>

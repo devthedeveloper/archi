@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 11 · Comments &amp; Votes — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch10.html">← Ch 10 · Posts &amp; Feeds</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch12.html">Ch 12 · Polish, Test, Ship →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#fff8b8"><small>chapter</small><span>11</span></div>
+  <div>
+    <h1>Comments &amp; Votes</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#f5b301" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">recursive trees, one-vote-per-user upserts, and transactions that keep scores honest</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>modeling a tree in a flat SQL table with <code>parent_id</code></li>
+    <li>rebuilding that tree in Go in O(n) — one map, one pass</li>
+    <li>UPSERT: <code>INSERT … ON CONFLICT DO UPDATE</code></li>
+    <li>your first real transaction, and why votes need one</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Threads are trees wearing a flat disguise</span></h2>
+
+<p>A Reddit thread is a tree: comments have replies, replies have replies. But SQL tables are
+flat. The classic move: every comment carries a <strong>parent_id</strong> — <code>NULL</code> for
+top-level comments, or the id of the comment it answers:</p>
+
+<div class="code-card"><span class="filename">the comments table, as a picture</span>
+<pre><code class="lang-bash">id | parent_id | body
+---+-----------+---------------------------
+ 1 |    NULL   | "Nice! Does it have hot ranking?"     ← top level
+ 2 |     1     |   ↳ "Yep, chapter 10!"                ← replies to 1
+ 3 |     2     |     ↳ "Marvelous."                    ← replies to 2
+ 4 |    NULL   | "First!"                              ← another root</code></pre>
+</div>
+
+<p>On the Go side, the struct points at itself — and two little type choices carry the whole
+design:</p>
+
+<div class="code-card"><span class="filename new">internal/store/comments.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/comments.go#L1-L20">package store
+
+import (
+	"database/sql"
+	"errors"
+)
+
+// Comment is one comment. ParentID is a *pointer* so a top-level comment
+// serialises as null (or disappears, thanks to omitempty) instead of 0.
+// Replies makes the type recursive — a comment holds its own children.
+type Comment struct {
+	ID        int64      `json:"id"`
+	PostID    int64      `json:"post_id"`
+	ParentID  *int64     `json:"parent_id,omitempty"`
+	Author    string     `json:"author"`
+	Body      string     `json:"body"`
+	Score     int64      `json:"score"`
+	CreatedAt string     `json:"created_at"`
+	Replies   []*Comment `json:"replies,omitempty"`
+}</code></pre>
+</div>
+
+<ul>
+  <li><strong><code>ParentID *int64</code></strong> — a pointer, because “no parent” is a real
+      state. SQL's NULL becomes Go's nil becomes JSON's <em>absent key</em>. An <code>int64</code>
+      would silently turn NULL into 0 — a lie with a comment id.</li>
+  <li><strong><code>Replies []*Comment</code></strong> — the recursion. JSON nests it as deep as
+      the conversation goes.</li>
+</ul>
+
+<h2><span class="swipe teal">Writing comments — with a parent check</span></h2>
+
+<div class="code-card"><span class="filename">internal/store/comments.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/comments.go#func CreateComment">// CreateComment adds a comment to a post. A nil parentID means a
+// top-level comment; otherwise the parent must be a comment on the SAME
+// post (ErrInvalidParent if it isn't).
+func (s *Store) CreateComment(postID, authorID int64, parentID *int64, body string) (*Comment, error) {
+	// Make sure the post exists.
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM posts WHERE id = ?`, postID).Scan(&amp;one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Make sure the parent comment (if any) belongs to this post.
+	if parentID != nil {
+		var parentPostID int64
+		err := s.db.QueryRow(`SELECT post_id FROM comments WHERE id = ?`, *parentID).Scan(&amp;parentPostID)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil &amp;&amp; parentPostID != postID) {
+			return nil, ErrInvalidParent
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var c Comment
+	err = s.db.QueryRow(`
+        INSERT INTO comments (post_id, author_id, parent_id, body)
+        VALUES (?, ?, ?, ?)
+        RETURNING id, post_id, parent_id, body, score, created_at`,
+		postID, authorID, parentID, body,
+	).Scan(&amp;c.ID, &amp;c.PostID, &amp;c.ParentID, &amp;c.Body, &amp;c.Score, &amp;c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.db.QueryRow(`SELECT username FROM users WHERE id = ?`, authorID).Scan(&amp;c.Author)
+	if err != nil {
+		return nil, err
+	}
+	return &amp;c, nil
+}</code></pre>
+</div>
+
+<p>The middle block is defensive SQL worth copying: a reply's parent must <em>exist</em> and must
+<em>belong to the same post</em> — otherwise someone could stitch a reply from one thread into
+another (the <code>ErrInvalidParent</code> sentinel becomes a 422 upstairs).</p>
+
+<h2><span class="swipe pink">Reading the tree — the O(n) party trick</span></h2>
+
+<div class="code-card"><span class="filename">internal/store/comments.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/comments.go#func CommentsForPost">// CommentsForPost returns the full comment TREE for a post: top-level
+// comments with their replies nested inside, oldest first.
+func (s *Store) CommentsForPost(postID int64) ([]*Comment, error) {
+	rows, err := s.db.Query(`
+        SELECT c.id, c.post_id, c.parent_id, u.username, c.body, c.score, c.created_at
+        FROM comments c
+        JOIN users u ON u.id = c.author_id
+        WHERE c.post_id = ?
+        ORDER BY c.id ASC`,
+		postID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	flat := []*Comment{}
+	for rows.Next() {
+		var c Comment
+		err := rows.Scan(&amp;c.ID, &amp;c.PostID, &amp;c.ParentID, &amp;c.Author, &amp;c.Body, &amp;c.Score, &amp;c.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		flat = append(flat, &amp;c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return buildTree(flat), nil
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename">internal/store/comments.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/comments.go#func buildTree">// buildTree turns a flat list of comments into a nested tree in O(n).
+// Trick: because we ordered by id ASC, every parent appears in the map
+// before any of its children shows up.
+func buildTree(flat []*Comment) []*Comment {
+	byID := make(map[int64]*Comment, len(flat))
+	for _, c := range flat {
+		byID[c.ID] = c
+	}
+
+	roots := []*Comment{}
+	for _, c := range flat {
+		if c.ParentID == nil {
+			roots = append(roots, c)
+		} else if parent, ok := byID[*c.ParentID]; ok {
+			parent.Replies = append(parent.Replies, c)
+		} else {
+			roots = append(roots, c) // orphan (parent deleted) — show at top level
+		}
+	}
+	return roots
+}</code></pre>
+</div>
+
+<p>Read <code>buildTree</code> twice — it's four lines of logic doing something lovely:</p>
+<ol>
+  <li><strong>Pass 1:</strong> index every comment by id in a map.</li>
+  <li><strong>Pass 2:</strong> each comment either joins <code>roots</code> (no parent) or appends
+      itself to its parent's <code>Replies</code> — found instantly via the map.</li>
+</ol>
+<p>Because the slice holds <em>pointers</em>, “append to parent's Replies” mutates the same
+comment that's already sitting in the map/roots — <span class="hl y">the tree wires itself up in
+place, no recursion, no N² scanning, no recursive SQL</span>. Two passes over n comments: O(n).</p>
+
+<div class="box deep">
+  <span class="box-title">Why fetching by id-order matters… and doesn't</span>
+  <p>We ORDER BY id ASC, so parents always precede children (you can't reply to a comment that
+  doesn't exist yet). buildTree doesn't strictly need that — the map is fully populated before
+  pass 2 — but the ordering gives us oldest-first threads for free, and the orphan branch
+  (parent deleted someday?) degrades gracefully to top level instead of vanishing.</p>
+</div>
+
+<h2><span class="swipe green">Votes — the database keeps everyone honest</span></h2>
+
+<p>Rules: one vote per user per thing, +1 or −1, changing your mind <em>replaces</em> the vote,
+value 0 takes it back. Chapter 5's schema already enforces the big one —
+<code>PRIMARY KEY (user_id, target_type, target_id)</code> means a second vote row for the same
+(user, thing) is <em>impossible</em>. So instead of insert-and-pray, we <strong>UPSERT</strong>:</p>
+
+<div class="code-card"><span class="filename new">internal/store/votes.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/votes.go">package store
+
+import (
+	"database/sql"
+	"errors"
+)
+
+// Vote records userID's vote on a post or comment and returns the target's
+// new score. value is +1 (upvote), -1 (downvote) or 0 (remove my vote).
+// Voting again simply replaces the earlier vote — that is the UPSERT.
+//
+// Everything runs inside one transaction so the votes table and the
+// cached score column can never drift apart.
+func (s *Store) Vote(userID int64, targetType string, targetID int64, value int) (int64, error) {
+	table := "posts"
+	if targetType == "comment" {
+		table = "comments"
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	// 1. Does the thing being voted on actually exist?
+	var one int
+	err = tx.QueryRow(`SELECT 1 FROM `+table+` WHERE id = ?`, targetID).Scan(&amp;one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	// 2. Record (or remove) the vote.
+	if value == 0 {
+		_, err = tx.Exec(`
+            DELETE FROM votes
+            WHERE user_id = ? AND target_type = ? AND target_id = ?`,
+			userID, targetType, targetID)
+	} else {
+		_, err = tx.Exec(`
+            INSERT INTO votes (user_id, target_type, target_id, value)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (user_id, target_type, target_id)
+            DO UPDATE SET value = excluded.value`,
+			userID, targetType, targetID, value)
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	// 3. Recompute the score from the source of truth and return it.
+	var score int64
+	err = tx.QueryRow(`
+        UPDATE `+table+` SET score = (
+            SELECT COALESCE(SUM(value), 0) FROM votes
+            WHERE target_type = ? AND target_id = ?
+        )
+        WHERE id = ?
+        RETURNING score`,
+		targetType, targetID, targetID,
+	).Scan(&amp;score)
+	if err != nil {
+		return 0, err
+	}
+
+	return score, tx.Commit()
+}</code></pre>
+</div>
+
+<p>Why the transaction? The score lives in two places: the <code>votes</code> table (truth) and
+the <code>score</code> column (a cache that makes feeds fast). Two requests racing — ada upvoting
+while linus downvotes — could interleave their writes and leave the cache wrong forever.
+<code>Begin … Commit</code> makes each vote's write-then-recompute <span class="hl y">atomic: both
+steps or neither, with no interleaving in between</span>.</p>
+
+<div class="box tip">
+  <span class="box-title">The defer tx.Rollback() idiom</span>
+  <p>Deferring Rollback right after Begin means any early return (the 404, an SQL error, a panic)
+  automatically unwinds the transaction. After a successful <code>Commit()</code> the deferred
+  Rollback is a harmless no-op. One line, no leak paths.</p>
+</div>
+
+<h2><span class="swipe blue">Handlers — small, because the store did the work</span></h2>
+
+<div class="code-card"><span class="filename new">cmd/api/comments.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/comments.go#func createCommentHandler">// createCommentHandler — POST /api/v1/posts/{id}/comments (auth required)
+// Body: {"body": "..."} for a top-level comment, or
+// {"body": "...", "parent_id": 42} to reply to comment 42.
+func (app *application) createCommentHandler(w http.ResponseWriter, r *http.Request) {
+	postID, err := app.readIDParam(r)
+	if err != nil {
+		app.notFound(w)
+		return
+	}
+
+	var input struct {
+		Body     string `json:"body"`
+		ParentID *int64 `json:"parent_id"` // pointer: absent JSON key -&gt; nil
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	p := make(problems)
+	p.check(strings.TrimSpace(input.Body) != "", "body", "must be provided")
+	p.check(len(input.Body) &lt;= 10_000, "body", "must be at most 10,000 characters")
+	if len(p) &gt; 0 {
+		app.failedValidation(w, p)
+		return
+	}
+
+	user := app.currentUser(r)
+	comment, err := app.store.CreateComment(postID, user.ID, input.ParentID, input.Body)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.notFound(w)
+		case errors.Is(err, store.ErrInvalidParent):
+			app.failedValidation(w, problems{"parent_id": "must be a comment on this post"})
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	app.writeJSON(w, http.StatusCreated, envelope{"comment": comment})
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename new">cmd/api/votes.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/votes.go">package main
+
+import (
+	"errors"
+	"net/http"
+
+	"gopherit/internal/store"
+)
+
+// votePostHandler — POST /api/v1/posts/{id}/vote (auth required)
+func (app *application) votePostHandler(w http.ResponseWriter, r *http.Request) {
+	app.voteHandler(w, r, "post")
+}
+
+// voteCommentHandler — POST /api/v1/comments/{id}/vote (auth required)
+func (app *application) voteCommentHandler(w http.ResponseWriter, r *http.Request) {
+	app.voteHandler(w, r, "comment")
+}
+
+// voteHandler does the shared work. Body: {"value": 1 | -1 | 0}
+// (0 means "take my vote back").
+func (app *application) voteHandler(w http.ResponseWriter, r *http.Request, targetType string) {
+	id, err := app.readIDParam(r)
+	if err != nil {
+		app.notFound(w)
+		return
+	}
+
+	var input struct {
+		Value *int `json:"value"` // pointer so a missing key != a 0 vote
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	p := make(problems)
+	p.check(input.Value != nil, "value", "must be provided")
+	if input.Value != nil {
+		v := *input.Value
+		p.check(v == -1 || v == 0 || v == 1, "value", "must be -1, 0 or 1")
+	}
+	if len(p) &gt; 0 {
+		app.failedValidation(w, p)
+		return
+	}
+
+	user := app.currentUser(r)
+	score, err := app.store.Vote(user.ID, targetType, id, *input.Value)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.notFound(w)
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	app.writeJSON(w, http.StatusOK, envelope{
+		"score":     score,
+		"your_vote": *input.Value,
+	})
+}</code></pre>
+</div>
+
+<p>Spot <code>Value *int</code> — the pointer trick again, this round for input: JSON
+<code>{"value": 0}</code> (take my vote back) and a missing <code>value</code> key must be
+distinguishable, and only a pointer can tell absent-nil from present-zero.</p>
+
+<h2><span class="swipe">The grand finale demo</span></h2>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># comment, then reply to it (parent_id: 1):
+$ curl -s -X POST localhost:4000/api/v1/posts/1/comments \
+    -H "Authorization: Bearer $TOKEN" -d '{"body":"Congrats! How long did it take?"}'
+{
+	"comment": {
+		"id": 1,
+		"post_id": 1,
+		"author": "ada",
+		"body": "Congrats! How long did it take?",
+		"score": 0,
+		"created_at": "2026-07-07T15:35:44Z"
+	}
+}
+$ curl -s -X POST localhost:4000/api/v1/posts/1/comments \
+    -H "Authorization: Bearer $TOKEN" -d '{"body":"About a weekend.","parent_id":1}' > /dev/null
+
+# the post now returns a nested tree:
+$ curl -s localhost:4000/api/v1/posts/1
+{
+	"comments": [
+		{
+			"id": 1,
+			"post_id": 1,
+			"author": "ada",
+			"body": "Congrats! How long did it take?",
+			"score": 0,
+			"created_at": "2026-07-07T15:35:44Z",
+			"replies": [
+				{
+					"id": 2,
+					"post_id": 1,
+					"parent_id": 1,
+					"author": "ada",
+					"body": "About a weekend.",
+					"score": 0,
+					"created_at": "2026-07-07T15:35:44Z"
+				}
+			]
+		}
+	],
+	"post": { "id": 1, "title": "I just built my first REST API in Go!", "score": 1,
+	          "comment_count": 2, "author": "ada", "subreddit": "golang",
+	          "body": "Following the handwritten notes ebook. AMA.",
+	          "created_at": "2026-07-07T15:35:44Z" }
+}
+
+# voting: up, then change my mind, then take it back —
+$ curl -s -X POST localhost:4000/api/v1/posts/1/vote \
+    -H "Authorization: Bearer $TOKEN" -d '{"value":1}'
+{
+	"score": 1,
+	"your_vote": 1
+}
+$ curl -s -X POST localhost:4000/api/v1/posts/1/vote \
+    -H "Authorization: Bearer $TOKEN" -d '{"value":-1}'
+{
+	"score": 0,
+	"your_vote": -1
+}
+$ curl -s -X POST localhost:4000/api/v1/posts/1/vote \
+    -H "Authorization: Bearer $TOKEN" -d '{"value":0}'
+{
+	"score": 1,
+	"your_vote": 0
+}
+
+# replying to a comment from a DIFFERENT post? blocked:
+$ curl -s -X POST localhost:4000/api/v1/posts/2/comments \
+    -H "Authorization: Bearer $TOKEN" -d '{"body":"reply","parent_id":1}'
+{
+	"error": {
+		"parent_id": "must be a comment on this post"
+	}
+}</code></pre>
+</div>
+
+<span class="scribble o">that's the entire Reddit data model working. take a walk, you earned it 🚶</span>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Trees in SQL: a nullable <code>parent_id</code> pointing at the same table.</li>
+  <li>Pointer fields model NULL honestly — in output (parent_id) and input (vote value).</li>
+  <li>buildTree: map by id, then one pass appending children to parents. O(n).</li>
+  <li>UPSERT (<code>ON CONFLICT DO UPDATE</code>) + composite PK = one vote per user, guaranteed.</li>
+  <li>When two writes must land together, wrap them in a transaction; defer Rollback immediately.</li>
+</ul>
+<p><b>Next up:</b> the last lap — graceful shutdown, an automated test suite, a production build,
+and the keys to your own Reddit.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch10.html">← Ch 10 · Posts &amp; Feeds</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch12.html">Ch 12 · Polish, Test, Ship →</a>
+</nav>
+
+</div>
+</body>
+</html>

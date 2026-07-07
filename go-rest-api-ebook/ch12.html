@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 12 · Polish, Test, Ship — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch11.html">← Ch 11 · Comments &amp; Votes</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="index.html">Cover →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#ffe1c9"><small>chapter</small><span>12</span></div>
+  <div>
+    <h1>Polish, Test, Ship</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#ff5722" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">graceful shutdown, a real test suite, a production binary — and the keys to your Reddit</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this final chapter ✍️</h4>
+  <ul>
+    <li>graceful shutdown — finish every request before the lights go out</li>
+    <li>integration tests with <code>httptest</code> that exercise the whole API</li>
+    <li>building &amp; cross-compiling a single-file deployable binary</li>
+    <li>what to build next — frontends, features, upgrades</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Graceful shutdown — paying chapter 3's IOU</span></h2>
+
+<p>Right now, Ctrl+C (or a redeploy sending SIGTERM) kills the process mid-request — a user's
+half-written comment just… evaporates. The fix: catch the signal, stop accepting new requests, and
+give in-flight ones ten seconds to finish. Here's <code>main.go</code> in its final form:</p>
+
+<div class="code-card"><span class="filename">cmd/api/main.go — final</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/main.go">// gopherit — a Reddit-clone REST API built with Go's standard library.
+// This is the companion project for the "Go + REST: Build Your Own Reddit"
+// handwritten-notes ebook.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"gopherit/internal/store"
+)
+
+const version = "1.0.0"
+
+// config holds everything tweakable from the outside world.
+type config struct {
+	port int
+	env  string
+	dsn  string
+}
+
+// application is the "toolbox" every handler can reach: config, a logger
+// and the data layer. Handlers hang off it as methods.
+type application struct {
+	config config
+	logger *slog.Logger
+	store  *store.Store
+}
+
+func main() {
+	var cfg config
+	flag.IntVar(&amp;cfg.port, "port", 4000, "API server port")
+	flag.StringVar(&amp;cfg.env, "env", "development", "Environment (development|production)")
+	flag.StringVar(&amp;cfg.dsn, "dsn", "gopherit.db", "SQLite database file")
+	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	st, err := store.Open(cfg.dsn)
+	if err != nil {
+		logger.Error("cannot open database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	logger.Info("database ready", "dsn", cfg.dsn)
+
+	app := &amp;application{
+		config: cfg,
+		logger: logger,
+		store:  st,
+	}
+
+	srv := &amp;http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.port),
+		Handler:      app.routes(),
+		IdleTimeout:  time.Minute,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// Graceful shutdown: when Ctrl+C (SIGINT) or SIGTERM arrives, stop
+	// accepting new requests and give in-flight ones 10s to finish.
+	shutdownErr := make(chan error)
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		sig := &lt;-quit
+
+		logger.Info("shutting down", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shutdownErr &lt;- srv.Shutdown(ctx)
+	}()
+
+	logger.Info("starting server", "addr", srv.Addr, "env", cfg.env, "version", version)
+
+	err = srv.ListenAndServe()
+	if !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("server error", "error", err)
+		os.Exit(1)
+	}
+	if err := &lt;-shutdownErr; err != nil {
+		logger.Error("graceful shutdown failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("server stopped gracefully")
+}</code></pre>
+</div>
+
+<p>The choreography, step by step:</p>
+<ol>
+  <li>A background goroutine parks on <code>&lt;-quit</code>, asleep until SIGINT/SIGTERM arrives.</li>
+  <li>On a signal it calls <code>srv.Shutdown(ctx)</code>: the listener closes (no new connections),
+      in-flight requests get up to 10s to complete (that's the context timeout).</li>
+  <li>Meanwhile <code>ListenAndServe</code> returns <code>http.ErrServerClosed</code> — for once,
+      <span class="hl y">an error that means everything went right</span> — so we treat it as the
+      happy path and wait on the channel for Shutdown's verdict.</li>
+</ol>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go run ./cmd/api
+time=2026-07-07T15:35:44.601Z level=INFO msg="starting server" addr=:4000 env=development version=1.0.0
+^C
+time=2026-07-07T15:35:44.659Z level=INFO msg="shutting down" signal=interrupt
+time=2026-07-07T15:35:44.660Z level=INFO msg="server stopped gracefully"</code></pre>
+</div>
+
+<h2><span class="swipe teal">Tests that hit the real thing</span></h2>
+
+<p>Unit tests are nice; for an API, <strong>integration tests</strong> earn their rent: spin up the
+<em>entire app</em> — router, middleware, handlers, store, a throw-away SQLite file — and walk
+through it like a user would. Go's <code>net/http/httptest</code> makes this almost unfairly easy:</p>
+
+<div class="code-card"><span class="filename new">cmd/api/api_test.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/api_test.go#func newTestServer">// newTestServer spins up the whole app against a throw-away database.
+// t.TempDir() is deleted automatically when the test finishes.
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	app := &amp;application{
+		config: config{env: "test"},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), // silence logs
+		store:  st,
+	}
+
+	ts := httptest.NewServer(app.routes())
+	t.Cleanup(ts.Close)
+	return ts
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename">cmd/api/api_test.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/api_test.go#func do">// do sends a JSON request and decodes the JSON response into a map.
+func do(t *testing.T, ts *httptest.Server, method, path, token string, body any) (int, map[string]any) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&amp;buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req, err := http.NewRequest(method, ts.URL+path, &amp;buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	res, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	var got map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&amp;got); err != nil {
+		t.Fatalf("decoding response from %s %s: %v", method, path, err)
+	}
+	return res.StatusCode, got
+}</code></pre>
+</div>
+
+<p>With those two helpers, the test reads like a story — register, get rejected as a duplicate,
+log in, hit a locked door without a token, then build a community, post, comment, reply and vote,
+checking status codes and payloads at every step. Here's the heart of it (the full file is in
+<a href="code/gopherit/cmd/api/api_test.go">the repo</a>):</p>
+
+<div class="code-card"><span class="filename">cmd/api/api_test.go — the story so far</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/api_test.go#L83-L136">// TestHappyPath walks the whole gopherit story: register, log in, create
+// a community, post, comment, reply and vote.
+func TestHappyPath(t *testing.T) {
+	ts := newTestServer(t)
+
+	// Register.
+	status, got := do(t, ts, "POST", "/api/v1/users", "", map[string]any{
+		"username": "gopher",
+		"email":    "gopher@example.com",
+		"password": "secret-password",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("register: want 201, got %d (%v)", status, got)
+	}
+
+	// Duplicate registration must be rejected.
+	status, _ = do(t, ts, "POST", "/api/v1/users", "", map[string]any{
+		"username": "gopher",
+		"email":    "gopher@example.com",
+		"password": "secret-password",
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("duplicate register: want 409, got %d", status)
+	}
+
+	// Log in.
+	status, got = do(t, ts, "POST", "/api/v1/tokens", "", map[string]any{
+		"email":    "gopher@example.com",
+		"password": "secret-password",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("login: want 201, got %d (%v)", status, got)
+	}
+	token, _ := got["token"].(string)
+	if token == "" {
+		t.Fatal("login response did not include a token")
+	}
+
+	// Creating a subreddit without a token must fail.
+	status, _ = do(t, ts, "POST", "/api/v1/subreddits", "", map[string]any{
+		"name": "golang", "title": "The Go community",
+	})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("anonymous create subreddit: want 401, got %d", status)
+	}
+
+	// With the token it succeeds.
+	status, got = do(t, ts, "POST", "/api/v1/subreddits", token, map[string]any{
+		"name": "golang", "title": "The Go community", "description": "Gophers welcome",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create subreddit: want 201, got %d (%v)", status, got)
+	}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go test -v ./cmd/api
+=== RUN   TestHealthz
+--- PASS: TestHealthz (0.02s)
+=== RUN   TestHappyPath
+--- PASS: TestHappyPath (0.92s)
+PASS
+ok  	gopherit/cmd/api	0.944s</code></pre>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Why is the test ~1 second? bcrypt!</span>
+  <p>Cost 12 hashing takes ~250ms and the test registers + logs in. That's the security feature
+  working as designed. Test suites at big shops inject a lower bcrypt cost in test config — a
+  nice first refactor if the wait annoys you.</p>
+</div>
+
+<h2><span class="swipe pink">Build it, ship it</span></h2>
+
+<p>Go's deployment story is the industry's envy: <strong>one static binary</strong>, no runtime,
+no node_modules, no Python venv. And because our SQLite driver is pure Go, cross-compiling to any
+OS is a two-variable affair:</p>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># a lean production binary for this machine (-s -w strips debug symbols):
+$ go build -ldflags="-s -w" -o gopherit-api ./cmd/api
+$ ls -lh gopherit-api
+-rwxr-xr-x 1 you you 9.9M gopherit-api
+
+# ...or for a Linux server / a Raspberry Pi / a Mac, from anywhere:
+$ GOOS=linux  GOARCH=amd64 go build -o gopherit-linux  ./cmd/api
+$ GOOS=linux  GOARCH=arm64 go build -o gopherit-pi     ./cmd/api
+$ GOOS=darwin GOARCH=arm64 go build -o gopherit-mac    ./cmd/api
+
+# run it in production mode:
+$ ./gopherit-api -port 4000 -env production -dsn /var/lib/gopherit/gopherit.db</code></pre>
+</div>
+
+<p>Copy that one file to any $5 VPS, run it behind a TLS reverse proxy
+(<a href="https://caddyserver.com/">Caddy</a> does automatic HTTPS in two config lines), and your
+Reddit is on the internet. Prefer containers? The repo includes a two-stage Dockerfile that builds
+a ~12&nbsp;MB image:</p>
+
+<div class="code-card"><span class="filename new">Dockerfile</span>
+<pre><code class="lang-bash">FROM golang:1.24 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /gopherit ./cmd/api
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /gopherit /gopherit
+EXPOSE 4000
+VOLUME /data
+ENTRYPOINT ["/gopherit", "-dsn", "/data/gopherit.db", "-env", "production"]</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="box-title">The pre-flight checklist for real traffic</span>
+  <p>① Serve HTTPS only (the reverse proxy handles it). ② Pin
+  <code>Access-Control-Allow-Origin</code> to your actual frontend's domain — chapter 8's one-line
+  change. ③ Add rate limiting to <code>POST /tokens</code> before someone brute-forces passwords.
+  ④ Back up the .db file (it's just a file — <code>sqlite3 gopherit.db ".backup backup.db"</code>).</p>
+</div>
+
+<h2><span class="swipe green">Plug in a frontend — any frontend</span></h2>
+
+<p>This is the moment the “backend only” promise pays out. Everything a UI needs is three fetch
+patterns:</p>
+
+<div class="code-card"><span class="filename">any-frontend.js — the whole integration</span>
+<pre><code class="lang-go">const API = "http://localhost:4000/api/v1";
+
+// 1. log in once, keep the token:
+const { token } = await (await fetch(`${API}/tokens`, {
+  method: "POST",
+  body: JSON.stringify({ email, password }),
+})).json();
+
+// 2. read things (no auth needed):
+const { posts, meta } = await (await fetch(`${API}/posts?sort=hot`)).json();
+
+// 3. do things (token in the header):
+await fetch(`${API}/posts/${id}/vote`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ value: 1 }),
+});</code></pre>
+</div>
+
+<p>Build the UI in React, Vue, Svelte, HTMX, Flutter, SwiftUI, or a
+<code>curl</code>-powered bash script — the API doesn't know and doesn't care. That's the whole
+point of the contract you've built.</p>
+
+<h2><span class="swipe blue">Your quest log from here</span></h2>
+
+<div class="tbl-scroll">
+<table class="notes">
+  <tr><th>Quest</th><th>What you'll practice</th></tr>
+  <tr><td>⭐ <b>Edit &amp; delete</b> posts/comments — authors only</td><td>PATCH/DELETE methods, ownership checks (compare <code>currentUser</code> to <code>author_id</code>, 403 Forbidden)</td></tr>
+  <tr><td>⭐ <b>Logout</b> endpoint</td><td><code>DELETE /tokens</code> — one SQL statement, instant revocation</td></tr>
+  <tr><td>⭐⭐ <b>Rate limiting</b> middleware</td><td><code>golang.org/x/time/rate</code>, per-IP limiter maps, another onion layer</td></tr>
+  <tr><td>⭐⭐ <b>Search</b> posts</td><td>SQLite FTS5 full-text search — it's built in!</td></tr>
+  <tr><td>⭐⭐ <b>User pages</b> — karma, their posts</td><td>aggregate queries, <code>GET /users/{username}</code></td></tr>
+  <tr><td>⭐⭐⭐ <b>Cursor pagination</b></td><td>replace OFFSET with “after id X” — how real feeds scale</td></tr>
+  <tr><td>⭐⭐⭐ <b>Swap SQLite → Postgres</b></td><td>feel the store-layer payoff: handlers shouldn't change at all</td></tr>
+  <tr><td>⭐⭐⭐ <b>Numbered migrations</b></td><td>adopt <code>goose</code> or <code>golang-migrate</code> like the pros</td></tr>
+</table>
+</div>
+
+<div class="sticky green">
+  <h4>Where to keep learning 📚</h4>
+  <ul>
+    <li>your own <a href="https://github.com/devthedeveloper/gocheatsheet">gocheatsheet</a> — now you know why the web page exists</li>
+    <li><i>Let's Go</i> &amp; <i>Let's Go Further</i> by Alex Edwards — the gold-standard deep dives</li>
+    <li><a href="https://go.dev/doc/database/">go.dev/doc/database</a> and the <code>net/http</code> docs — shockingly readable</li>
+    <li>the <a href="https://github.com/golang-standards/project-layout">project-layout</a> debates — know the conventions, then relax about them</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">The last page</span></h2>
+
+<p>Look at what's in your <code>gopherit</code> folder: a real API with auth, a relational schema
+with integrity constraints, middleware, pagination, ranking math, transactions, tests, and a
+deployment story — <span class="hl y">in about a thousand lines of Go, with two dependencies</span>.
+Every concept in here transfers straight to any backend you'll ever build, in any language.</p>
+
+<p style="font-family:var(--hand);font-size:30px;text-align:center;margin:36px 0;transform:rotate(-1deg)">
+Now go build your Reddit. And when someone asks how it works —<br>
+<span class="pen-o">you can explain every single line.</span> 🐹🧡</p>
+
+<div class="recap">
+<h2><span class="swipe">The whole book on one sticky note 📌</span></h2>
+<ul class="checklist">
+  <li>HTTP handlers: read r, write w — everything else is arrangement.</li>
+  <li>Layers: handlers speak HTTP, the store speaks SQL, sentinel errors translate between them.</li>
+  <li>Helpers once (readJSON/writeJSON/problems), reused everywhere.</li>
+  <li>Security is defaults: bcrypt, hashed tokens, identical 401s, parameterized SQL, json:"-".</li>
+  <li>The database enforces truth: UNIQUE, CHECK, FKs, composite PKs, transactions.</li>
+  <li>Test the whole app with httptest; ship one static binary.</li>
+</ul>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch11.html">← Ch 11 · Comments &amp; Votes</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="index.html">Back to the cover →</a>
+</nav>
+
+</div>
+</body>
+</html>
