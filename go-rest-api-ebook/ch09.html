@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 9 · Subreddits — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch08.html">← Ch 8 · Middleware</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch10.html">Ch 10 · Posts &amp; Feeds →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#d9f7cd"><small>chapter</small><span>9</span></div>
+  <div>
+    <h1>Subreddits</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#0e9f91" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">the first complete resource — and the template for every one after it</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>designing a resource with a human-friendly natural key (<code>/subreddits/golang</code>)</li>
+    <li>slug validation with a compiled regex</li>
+    <li>iterating rows with <code>rows.Next()</code> — the cursor dance</li>
+    <li>the 201 + <code>Location</code> header handshake</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Communities, by design</span></h2>
+
+<p>A subreddit has a <strong>name</strong> like <code>golang</code> — lowercase, no spaces, unique.
+Because names are unique and never change, we use them <em>as the URL id</em>:
+<span class="hl y"><code>/api/v1/subreddits/golang</code></span> beats
+<code>/api/v1/subreddits/17</code> for humans, for logs, and for sharing links. (That's called a
+<b>natural key</b>. Posts will keep numeric ids — titles aren't unique.)</p>
+
+<p>Three endpoints today, one of them gated:</p>
+<p>
+  <span class="ep post lock">POST /api/v1/subreddits</span> &nbsp;
+  <span class="ep get">GET /api/v1/subreddits</span> &nbsp;
+  <span class="ep get">GET /api/v1/subreddits/{name}</span>
+</p>
+
+<h2><span class="swipe teal">The store side</span></h2>
+
+<div class="code-card"><span class="filename new">internal/store/subreddits.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/subreddits.go">package store
+
+import (
+	"database/sql"
+	"errors"
+)
+
+// Subreddit is a community, like r/golang.
+type Subreddit struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	CreatorID   int64  `json:"creator_id"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// CreateSubreddit inserts a community. Returns ErrDuplicate when the name
+// is already taken.
+func (s *Store) CreateSubreddit(name, title, description string, creatorID int64) (*Subreddit, error) {
+	var sr Subreddit
+	err := s.db.QueryRow(`
+        INSERT INTO subreddits (name, title, description, creator_id)
+        VALUES (?, ?, ?, ?)
+        RETURNING id, name, title, description, creator_id, created_at`,
+		name, title, description, creatorID,
+	).Scan(&amp;sr.ID, &amp;sr.Name, &amp;sr.Title, &amp;sr.Description, &amp;sr.CreatorID, &amp;sr.CreatedAt)
+
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicate
+		}
+		return nil, err
+	}
+	return &amp;sr, nil
+}
+
+// SubredditByName fetches one community. Returns ErrNotFound if missing.
+func (s *Store) SubredditByName(name string) (*Subreddit, error) {
+	var sr Subreddit
+	err := s.db.QueryRow(`
+        SELECT id, name, title, description, creator_id, created_at
+        FROM subreddits
+        WHERE name = ?`,
+		name,
+	).Scan(&amp;sr.ID, &amp;sr.Name, &amp;sr.Title, &amp;sr.Description, &amp;sr.CreatorID, &amp;sr.CreatedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &amp;sr, nil
+}
+
+// ListSubreddits returns every community, newest first.
+func (s *Store) ListSubreddits() ([]Subreddit, error) {
+	rows, err := s.db.Query(`
+        SELECT id, name, title, description, creator_id, created_at
+        FROM subreddits
+        ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	subreddits := []Subreddit{}
+	for rows.Next() {
+		var sr Subreddit
+		err := rows.Scan(&amp;sr.ID, &amp;sr.Name, &amp;sr.Title, &amp;sr.Description, &amp;sr.CreatorID, &amp;sr.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		subreddits = append(subreddits, sr)
+	}
+	return subreddits, rows.Err()
+}</code></pre>
+</div>
+
+<p><code>ListSubreddits</code> introduces the multi-row dance you'll use forever:</p>
+
+<div class="flow">
+  <div class="node t">Query<small>get a cursor</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node v">defer rows.Close()<small>always!</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node b">for rows.Next()<small>scan each row</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node g">rows.Err()<small>did the loop die early?</small></div>
+</div>
+
+<div class="box gotcha">
+  <span class="box-title">Two row-loop traps</span>
+  <p><b>Forgetting <code>rows.Close()</code></b> leaks the connection — with our pool of one,
+  the <em>next</em> query would hang forever. Defer it immediately.<br>
+  <b>Forgetting <code>rows.Err()</code></b>: the loop ending might mean “no more rows” <em>or</em>
+  “the connection dropped mid-scan”. Only <code>rows.Err()</code> knows which story you're in.</p>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Why <code>subreddits := []Subreddit{}</code> and not <code>var subreddits []Subreddit</code>?</span>
+  <p>Both work in Go — but a nil slice marshals to JSON <code>null</code>, while an empty slice
+  marshals to <code>[]</code>. Frontends looping over <code>null</code> crash.
+  <span class="hl g">Initialize slices you're going to serialize.</span></p>
+</div>
+
+<h2><span class="swipe pink">The handler side</span></h2>
+
+<div class="code-card"><span class="filename new">cmd/api/subreddits.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/subreddits.go">package main
+
+import (
+	"errors"
+	"net/http"
+	"regexp"
+	"strings"
+
+	"gopherit/internal/store"
+)
+
+// Subreddit names look like reddit's: lowercase letters, digits and
+// underscores, 3–21 characters.
+var subredditNameRX = regexp.MustCompile(`^[a-z0-9_]{3,21}$`)
+
+// createSubredditHandler — POST /api/v1/subreddits  (auth required)
+// Body: {"name": "golang", "title": "The Go...", "description": "..."}
+func (app *application) createSubredditHandler(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	input.Name = strings.ToLower(strings.TrimSpace(input.Name))
+	input.Title = strings.TrimSpace(input.Title)
+
+	p := make(problems)
+	p.check(subredditNameRX.MatchString(input.Name), "name",
+		"must be 3-21 characters of lowercase letters, digits or underscores")
+	p.check(input.Title != "", "title", "must be provided")
+	p.check(len(input.Title) &lt;= 100, "title", "must be at most 100 characters")
+	p.check(len(input.Description) &lt;= 500, "description", "must be at most 500 characters")
+	if len(p) &gt; 0 {
+		app.failedValidation(w, p)
+		return
+	}
+
+	user := app.currentUser(r)
+	subreddit, err := app.store.CreateSubreddit(input.Name, input.Title, input.Description, user.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDuplicate):
+			app.conflict(w, "a subreddit with this name already exists")
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	w.Header().Set("Location", "/api/v1/subreddits/"+subreddit.Name)
+	app.writeJSON(w, http.StatusCreated, envelope{"subreddit": subreddit})
+}
+
+// getSubredditHandler — GET /api/v1/subreddits/{name}
+func (app *application) getSubredditHandler(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	subreddit, err := app.store.SubredditByName(name)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.notFound(w)
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	app.writeJSON(w, http.StatusOK, envelope{"subreddit": subreddit})
+}
+
+// listSubredditsHandler — GET /api/v1/subreddits
+func (app *application) listSubredditsHandler(w http.ResponseWriter, r *http.Request) {
+	subreddits, err := app.store.ListSubreddits()
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+	app.writeJSON(w, http.StatusOK, envelope{"subreddits": subreddits})
+}</code></pre>
+</div>
+
+<p>New tricks in this file:</p>
+<ul>
+  <li><strong>The compiled regex</strong> <code>subredditNameRX</code> lives at package level —
+      <code>MustCompile</code> runs once at startup, not per request. The pattern
+      <code>^[a-z0-9_]{3,21}$</code> reads: 3–21 chars of lowercase/digits/underscores, anchored at
+      both ends (<span class="hl p">forget the anchors and “../../etc/passwd” contains valid
+      characters somewhere in the middle</span>).</li>
+  <li><strong><code>app.currentUser(r)</code></strong> — chapter 8's context pays off: the handler
+      just asks who's calling. It can't be nil here, because <code>requireAuth</code> guards this
+      route.</li>
+  <li><strong>The <code>Location</code> header</strong> — a polite REST convention: a 201 tells the
+      client where the new resource now lives.</li>
+</ul>
+
+<h2><span class="swipe green">Try the whole lifecycle</span></h2>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># log in and keep the token in a shell variable:
+$ TOKEN=$(curl -s -X POST localhost:4000/api/v1/tokens \
+    -d '{"email":"ada@example.com","password":"correct-horse-battery"}' \
+    | grep -o '"token": "[^"]*"' | cut -d'"' -f4)
+
+# create a community:
+$ curl -s -X POST localhost:4000/api/v1/subreddits \
+    -H "Authorization: Bearer $TOKEN" \
+    -d '{"name":"golang","title":"The Go programming language","description":"Ask questions and post articles about Go."}'
+{
+	"subreddit": {
+		"id": 1,
+		"name": "golang",
+		"title": "The Go programming language",
+		"description": "Ask questions and post articles about Go.",
+		"creator_id": 1,
+		"created_at": "2026-07-07T15:45:08Z"
+	}
+}
+
+# a name that's taken → 409 Conflict:
+$ curl -s -X POST localhost:4000/api/v1/subreddits \
+    -H "Authorization: Bearer $TOKEN" -d '{"name":"golang","title":"go again"}'
+{
+	"error": "a subreddit with this name already exists"
+}
+
+# list them (public, no token) — newest first:
+$ curl -s localhost:4000/api/v1/subreddits
+{
+	"subreddits": [
+		{
+			"id": 2,
+			"name": "programmerhumor",
+			"title": "Programmer Humor",
+			"description": "Jokes about semicolons.",
+			"creator_id": 2,
+			"created_at": "2026-07-07T15:45:08Z"
+		},
+		{
+			"id": 1,
+			"name": "golang",
+			"title": "The Go programming language",
+			"description": "Ask questions and post articles about Go.",
+			"creator_id": 1,
+			"created_at": "2026-07-07T15:45:08Z"
+		}
+	]
+}
+
+# fetch one by name:
+$ curl -s localhost:4000/api/v1/subreddits/golang
+{
+	"subreddit": {
+		"id": 1,
+		"name": "golang",
+		"title": "The Go programming language",
+		"description": "Ask questions and post articles about Go.",
+		"creator_id": 1,
+		"created_at": "2026-07-07T15:45:08Z"
+	}
+}</code></pre>
+</div>
+
+<span class="scribble b">notice the pattern? store file + handler file + 2 route lines = a feature. we'll ride this template to the end 🏇</span>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Unique, immutable, human-readable field? Use it as the URL key.</li>
+  <li>Compile regexes once at package level; always anchor with <code>^</code> and <code>$</code>.</li>
+  <li>Row loops: defer Close, scan in a loop, check rows.Err() after.</li>
+  <li>Serialize <code>[]</code>, not <code>null</code> — initialize your slices.</li>
+  <li>201 Created + Location header = REST's “here's your new thing”.</li>
+</ul>
+<p><b>Next up:</b> posts — where pagination, sorting, and Reddit's famous “hot” algorithm enter
+the chat.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch08.html">← Ch 8 · Middleware</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch10.html">Ch 10 · Posts &amp; Feeds →</a>
+</nav>
+
+</div>
+</body>
+</html>

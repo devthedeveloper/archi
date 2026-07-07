@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · A Database in a File — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch04.html">← Ch 4 · Speaking JSON</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch06.html">Ch 6 · Users →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#d9f7cd"><small>chapter</small><span>5</span></div>
+  <div>
+    <h1>A Database That Fits in a File</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#2fa15c" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">SQLite without a C compiler, database/sql, and the schema behind every Reddit</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>why SQLite is the perfect learning (and often production!) database</li>
+    <li>how <code>database/sql</code> + a driver actually fit together</li>
+    <li>gopherit's six-table schema — foreign keys, uniques, checks</li>
+    <li>the <b>store</b>: one struct that owns every query in the app</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Why SQLite (and why this driver)</span></h2>
+
+<p>Postgres and MySQL are servers: install, configure, run, connect. <strong>SQLite is a
+library</strong> — your database is literally one file on disk (<code>gopherit.db</code>), and the
+engine runs inside your process. No installation, no ports, no passwords.
+<span class="hl y">It's not a toy:</span> SQLite sits inside every phone, browser and airliner, and
+happily serves small-to-medium websites.</p>
+
+<p>We'll use the <code>modernc.org/sqlite</code> driver, which is SQLite translated to
+<span class="hl g">pure Go</span> — <code>go build</code> just works on Windows, Mac and Linux,
+no C toolchain (“cgo”) required. Two commands add our only real dependencies:</p>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go get modernc.org/sqlite
+$ go get golang.org/x/crypto        # bcrypt — we'll need it next chapter
+$ go mod tidy</code></pre>
+</div>
+
+<div class="box deep">
+  <span class="box-title">How database/sql + drivers fit together</span>
+  <p>Go's std lib ships <code>database/sql</code> — a generic API (Query, Exec, transactions,
+  connection pooling) with <em>no</em> database inside. Drivers register themselves by name when
+  imported. That's why the import looks weird:
+  <code>_ "modernc.org/sqlite"</code> — the underscore means “run this package's init (which
+  registers the <code>"sqlite"</code> driver), I won't call it directly.” Your code talks only to
+  <code>database/sql</code> — swapping databases later barely changes it.</p>
+</div>
+
+<h2><span class="swipe teal">Designing the schema — reddit on a napkin</span></h2>
+
+<p>Every Reddit-shaped app is these six tables. Arrows mean “points at” (a foreign key):</p>
+
+<div class="flow">
+  <div class="node o">users<small>who</small></div>
+  <div class="arrow">⟵</div>
+  <div class="node t">subreddits<small>where</small></div>
+  <div class="arrow">⟵</div>
+  <div class="node v">posts<small>what</small></div>
+  <div class="arrow">⟵</div>
+  <div class="node b">comments<small>chatter (self-referencing!)</small></div>
+</div>
+<div class="flow">
+  <div class="node g">votes<small>one row per (user, thing) — points at posts OR comments</small></div>
+  <div class="arrow">+</div>
+  <div class="node o">tokens<small>login sessions → users</small></div>
+</div>
+
+<p>Here's the whole store bootstrap — connection, pragmas, and the schema, annotated below:</p>
+
+<div class="code-card"><span class="filename new">internal/store/store.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/store.go">// Package store is the data layer of gopherit. Everything that touches
+// the database lives here, so the HTTP handlers never write SQL.
+package store
+
+import (
+	"database/sql"
+	"errors"
+	"strings"
+
+	_ "modernc.org/sqlite" // registers the "sqlite" driver with database/sql
+)
+
+// Sentinel errors. Handlers compare against these with errors.Is and
+// translate them into the right HTTP status codes.
+var (
+	ErrNotFound      = errors.New("store: not found")
+	ErrDuplicate     = errors.New("store: duplicate value")
+	ErrInvalidParent = errors.New("store: parent comment does not belong to this post")
+)
+
+// Store wraps the database connection pool. Every model gets methods on
+// this one struct: s.CreateUser(...), s.ListPosts(...), and so on.
+type Store struct {
+	db *sql.DB
+}
+
+// Open connects to the SQLite file at dsn, applies pragmas and runs the
+// schema migration. Call Close when the application shuts down.
+func Open(dsn string) (*Store, error) {
+	db, err := sql.Open("sqlite", dsn+"?_pragma=foreign_keys(1)&amp;_pragma=journal_mode(WAL)&amp;_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+
+	// SQLite allows only one writer at a time. Limiting the pool to a
+	// single connection sidesteps "database is locked" errors entirely.
+	db.SetMaxOpenConns(1)
+
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+	return &amp;Store{db: db}, nil
+}
+
+// Close releases the underlying connection pool.
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+// isUniqueViolation reports whether err was caused by a UNIQUE constraint,
+// e.g. registering a username that is already taken.
+func isUniqueViolation(err error) bool {
+	return err != nil &amp;&amp; strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// schema is executed on every start-up. Thanks to IF NOT EXISTS it is a
+// no-op when the tables are already there — a poor man's migration that
+// is perfect for a learning project.
+const schema = `
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    email         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash BLOB    NOT NULL,
+    created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS tokens (
+    hash       BLOB PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subreddits (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    title       TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    creator_id  INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS posts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    subreddit_id INTEGER NOT NULL REFERENCES subreddits(id) ON DELETE CASCADE,
+    author_id    INTEGER NOT NULL REFERENCES users(id),
+    title        TEXT    NOT NULL,
+    body         TEXT    NOT NULL DEFAULT '',
+    url          TEXT    NOT NULL DEFAULT '',
+    score        INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    author_id  INTEGER NOT NULL REFERENCES users(id),
+    parent_id  INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+    body       TEXT    NOT NULL,
+    score      INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS votes (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_type TEXT    NOT NULL CHECK (target_type IN ('post','comment')),
+    target_id   INTEGER NOT NULL,
+    value       INTEGER NOT NULL CHECK (value IN (-1, 1)),
+    PRIMARY KEY (user_id, target_type, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_subreddit ON posts(subreddit_id);
+CREATE INDEX IF NOT EXISTS idx_comments_post   ON comments(post_id);
+`</code></pre>
+</div>
+
+<p>The SQL vocabulary doing the heavy lifting:</p>
+<div class="tbl-scroll">
+<table class="notes">
+  <tr><th>Piece</th><th>What it buys us</th></tr>
+  <tr><td><code>INTEGER PRIMARY KEY AUTOINCREMENT</code></td><td>auto-numbered ids: 1, 2, 3…</td></tr>
+  <tr><td><code>UNIQUE COLLATE NOCASE</code></td><td>“Ada” and “ada” are the same username — no lookalike accounts</td></tr>
+  <tr><td><code>REFERENCES users(id)</code></td><td>a foreign key: the DB refuses a post whose author doesn't exist</td></tr>
+  <tr><td><code>ON DELETE CASCADE</code></td><td>delete a post → its comments &amp; votes vanish too, automatically</td></tr>
+  <tr><td><code>CHECK (value IN (-1, 1))</code></td><td>the DB itself rejects a vote of +5 — last line of defense</td></tr>
+  <tr><td><code>PRIMARY KEY (user_id, target_type, target_id)</code></td><td>one vote per user per thing — enforced by the database, not by hope</td></tr>
+  <tr><td><code>DEFAULT (strftime(...))</code></td><td>timestamps stamp themselves, in UTC, in RFC-3339 format</td></tr>
+</table>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Why store timestamps as RFC-3339 strings?</span>
+  <p>SQLite has no real date type — you pick TEXT, INTEGER or REAL. We store
+  <code>2026-07-07T15:45:08Z</code> strings because they're human-readable in any DB browser,
+  they're already exactly what JSON wants, and — neat property — <span class="hl y">UTC RFC-3339
+  strings sort alphabetically in time order</span>, so <code>expires_at &gt; ?</code> comparisons
+  just work. We'll cash in on that in chapter 7.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="box-title">Three pragmas you must not skip</span>
+  <p><b>foreign_keys(1)</b> — SQLite ships with FK enforcement <em>off</em> for historical reasons.
+  Turn it on or your REFERENCES lines are decoration.<br>
+  <b>journal_mode(WAL)</b> — write-ahead logging: readers don't block the writer. Just better.<br>
+  <b>busy_timeout(5000)</b> — when the file is briefly locked, wait up to 5s instead of instantly
+  failing with “database is locked”.</p>
+  <p>And <code>db.SetMaxOpenConns(1)</code>: SQLite allows one writer at a time; giving the pool a
+  single connection makes lock errors impossible by construction. Plenty for a learning app.</p>
+</div>
+
+<div class="box deep">
+  <span class="box-title">“Poor man's migrations”</span>
+  <p>Real projects use numbered migration files (0001_create_users.sql, 0002_add_karma.sql…) with a
+  tool like <code>goose</code> or <code>golang-migrate</code> so schema changes are replayable and
+  reversible. Our <code>CREATE TABLE IF NOT EXISTS</code> restart-safe schema is the training-wheels
+  version — perfect here, worth outgrowing later.</p>
+</div>
+
+<h2><span class="swipe pink">Sentinel errors — the store's vocabulary</span></h2>
+
+<p>Look again at the top of store.go: <code>ErrNotFound</code>, <code>ErrDuplicate</code>,
+<code>ErrInvalidParent</code>. These are <strong>sentinel errors</strong> — named values the store
+returns instead of raw SQL errors. The handler layer matches them with <code>errors.Is</code> and
+picks status codes:</p>
+
+<div class="flow">
+  <div class="node t">store says<small>ErrNotFound</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node v">handler says<small>404</small></div>
+  <div class="arrow">·</div>
+  <div class="node t">store says<small>ErrDuplicate</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node v">handler says<small>409</small></div>
+</div>
+
+<p><span class="hl y">The store never mentions HTTP; handlers never mention SQL.</span> That's the
+layer boundary from chapter 1, enforced by vocabulary.</p>
+
+<h2><span class="swipe green">Wire it into main</span></h2>
+
+<p>Three additions to <code>main.go</code>: a <code>-dsn</code> flag, opening the store, and handing
+it to the application struct:</p>
+
+<div class="code-card"><span class="filename">cmd/api/main.go — the new bits</span>
+<pre><code class="lang-go">type config struct {
+	port int
+	env  string
+	dsn  string // NEW: where the SQLite file lives
+}
+
+type application struct {
+	config config
+	logger *slog.Logger
+	store  *store.Store // NEW: the data layer, one field away from every handler
+}
+
+func main() {
+	var cfg config
+	flag.IntVar(&cfg.port, "port", 4000, "API server port")
+	flag.StringVar(&cfg.env, "env", "development", "Environment (development|production)")
+	flag.StringVar(&cfg.dsn, "dsn", "gopherit.db", "SQLite database file") // NEW
+	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	st, err := store.Open(cfg.dsn) // NEW: connect + migrate
+	if err != nil {
+		logger.Error("cannot open database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	logger.Info("database ready", "dsn", cfg.dsn)
+
+	app := &application{
+		config: cfg,
+		logger: logger,
+		store:  st, // NEW
+	}
+	// ... http.Server setup unchanged ...
+}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go run ./cmd/api
+time=2026-07-07T15:35:41.201Z level=INFO msg="database ready" dsn=gopherit.db
+time=2026-07-07T15:35:41.203Z level=INFO msg="starting server" addr=:4000 env=development version=1.0.0
+
+# and a gopherit.db file has appeared next to go.mod ✨</code></pre>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Peek inside your database anytime</span>
+  <p>Install any SQLite browser (<a href="https://sqlitebrowser.org/">DB Browser for SQLite</a> is
+  lovely) and open <code>gopherit.db</code> — you'll literally watch rows appear as you curl.
+  Add <code>*.db</code> to your <code>.gitignore</code>; databases don't belong in git.</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>SQLite = the whole database in one file, engine inside your process. modernc driver = no C compiler.</li>
+  <li><code>database/sql</code> is the generic API; the blank-import driver plugs into it.</li>
+  <li>Let the schema defend itself: UNIQUE, CHECK, foreign keys, composite primary keys.</li>
+  <li>Pragmas: foreign_keys ON, WAL, busy_timeout. Pool size 1 for SQLite.</li>
+  <li>Store speaks sentinel errors; handlers translate them to status codes.</li>
+</ul>
+<p><b>Next up:</b> our first real rows — user accounts, with passwords handled the one and only
+acceptable way.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch04.html">← Ch 4 · Speaking JSON</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch06.html">Ch 6 · Users →</a>
+</nav>
+
+</div>
+</body>
+</html>

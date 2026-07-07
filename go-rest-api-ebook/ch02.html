@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · Hello, HTTP — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch01.html">← Ch 1 · Game Plan</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch03.html">Ch 3 · Skeleton →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#cdeeff"><small>chapter</small><span>2</span></div>
+  <div>
+    <h1>Hello, HTTP</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#2f80ed" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">your first Go web server — handlers, routing, path params, and JSON out</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>the two-argument handler signature that rules all Go web code</li>
+    <li>Go 1.22+ routing: <code>"GET /posts/{id}"</code> — methods &amp; params, no framework</li>
+    <li>reading path parameters and query strings</li>
+    <li>sending your first JSON response with struct tags</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Fifteen lines to a live server</span></h2>
+
+<p>Make a scratch folder anywhere (this one's a playground — the real project starts next chapter)
+and drop this in <code>main.go</code>:</p>
+
+<div class="code-card"><span class="filename new">hello/main.go</span>
+<pre><code class="lang-go" data-src="snippets:ch02-hello/main.go">package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Hello from Go! 🎉")
+	})
+
+	log.Println("listening on http://localhost:4000 ...")
+	log.Fatal(http.ListenAndServe(":4000", nil))
+}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal 1</span></div>
+<pre><code class="lang-bash">$ go mod init hello && go run .
+2026/07/07 15:46:41 listening on http://localhost:4000 ...</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal 2</span></div>
+<pre><code class="lang-bash">$ curl localhost:4000/hello
+Hello from Go! 🎉
+$ curl -i localhost:4000/nope
+HTTP/1.1 404 Not Found</code></pre>
+</div>
+
+<p>That's a real, concurrent, production-grade HTTP server. Go spins up
+<span class="hl y">a goroutine per connection</span> for you — thousands of simultaneous requests,
+zero extra code. (Goroutines feeling foggy? Your
+<a href="https://github.com/devthedeveloper/gocheatsheet">cheatsheet's concurrency page</a> has your back.)</p>
+
+<h2><span class="swipe teal">The handler signature — memorize this one</span></h2>
+
+<p>Every piece of Go web code you will ever write is a variation of this function shape:</p>
+
+<div class="code-card"><span class="filename">the shape of all handlers</span>
+<pre><code class="lang-go">func (w http.ResponseWriter, r *http.Request) {
+	// r = the request:  everything the client sent  (read from it)
+	// w = the response: your pen to write back      (write to it)
+}</code></pre>
+</div>
+
+<ul>
+  <li><strong class="pen-b">r *http.Request</strong> — the opened envelope: method, URL, headers,
+      body. You <em>read</em> from it.</li>
+  <li><strong class="pen-o">w http.ResponseWriter</strong> — the reply pen. You set headers, pick a
+      status code, and write bytes. <span class="hl p">Order matters:</span> headers first, then
+      <code>WriteHeader(status)</code>, then the body — once the body starts flowing, headers are
+      sealed.</li>
+</ul>
+
+<div class="box gotcha">
+  <span class="box-title">The classic beginner trap</span>
+  <p>Calling <code>w.WriteHeader(404)</code> <em>after</em> you've already written body bytes does
+  nothing except log a warning — the 200 already left the building. Write in the right order:
+  headers → status → body.</p>
+</div>
+
+<h2><span class="swipe pink">Routing like it's 2024 (because it is)</span></h2>
+
+<p>Since Go 1.22, the standard router — <code>http.ServeMux</code> — understands
+<strong>methods</strong> and <strong>path parameters</strong> in the pattern string. This is the
+feature that made half the routing frameworks optional:</p>
+
+<div class="code-card"><span class="filename new">routes/main.go</span>
+<pre><code class="lang-go" data-src="snippets:ch02-routes/main.go">package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+
+	// Method + exact path.
+	mux.HandleFunc("GET /posts", listPosts)
+	mux.HandleFunc("POST /posts", createPost)
+
+	// {id} is a path parameter — it matches one segment.
+	mux.HandleFunc("GET /posts/{id}", getPost)
+
+	log.Println("listening on http://localhost:4000 ...")
+	log.Fatal(http.ListenAndServe(":4000", mux))
+}
+
+func listPosts(w http.ResponseWriter, r *http.Request) {
+	// Query parameters live in the URL after the "?".
+	sort := r.URL.Query().Get("sort") // "" when absent
+	if sort == "" {
+		sort = "hot"
+	}
+	fmt.Fprintf(w, "a list of posts, sorted by %q\n", sort)
+}
+
+func createPost(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusCreated) // 201
+	fmt.Fprintln(w, "pretend we created a post")
+}
+
+func getPost(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id") // whatever matched {id}
+	fmt.Fprintf(w, "you asked for post number %s\n", id)
+}</code></pre>
+</div>
+
+<p>Give it a spin:</p>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ curl "localhost:4000/posts?sort=top"
+a list of posts, sorted by "top"
+
+$ curl localhost:4000/posts/7
+you asked for post number 7
+
+$ curl -i -X POST localhost:4000/posts
+HTTP/1.1 201 Created
+
+$ curl -i -X DELETE localhost:4000/posts
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD, POST</code></pre>
+</div>
+
+<p>Three things to tattoo somewhere handy:</p>
+<ul>
+  <li><code>"GET /posts/{id}"</code> — the pattern is <span class="hl y">method, space, path</span>.
+      <code>{id}</code> matches exactly one path segment, and <code>r.PathValue("id")</code> hands
+      it to you as a string.</li>
+  <li>Query parameters (<code>?sort=top&amp;page=2</code>) are <em>not</em> part of the route.
+      Fish them out with <code>r.URL.Query().Get("sort")</code> — you get <code>""</code> when absent,
+      so defaults are a one-liner.</li>
+  <li>That <strong>405 with an <code>Allow</code> header</strong>? The mux generated it for us —
+      it knows <code>/posts</code> exists but not for DELETE. Frameworks charge for this; std lib
+      does it free.</li>
+</ul>
+
+<div class="box tip">
+  <span class="box-title">Why we make our own mux</span>
+  <p>The hello example used <code>http.HandleFunc</code>, which quietly registers routes on a
+  package-global router (<code>DefaultServeMux</code>) that any imported library can also write to.
+  From now on we always build our own with <code>http.NewServeMux()</code> — explicit, testable,
+  no surprise roommates.</p>
+</div>
+
+<h2><span class="swipe green">JSON: teaching structs to talk</span></h2>
+
+<p>APIs speak JSON, and Go's <code>encoding/json</code> maps it onto structs. The magic knob is the
+<strong>struct tag</strong> — the backtick string that renames fields on their way out:</p>
+
+<div class="code-card"><span class="filename new">json/main.go</span>
+<pre><code class="lang-go" data-src="snippets:ch02-json/main.go">package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"time"
+)
+
+// The struct tags (the bits in backticks) control the JSON key names:
+// Title becomes "title", CreatedAt becomes "created_at".
+type Post struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Score     int       `json:"score"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func main() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /posts/{id}", func(w http.ResponseWriter, r *http.Request) {
+		post := Post{
+			ID:        1,
+			Title:     "Go is pretty nice actually",
+			Score:     42,
+			CreatedAt: time.Now().UTC(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(post); err != nil {
+			log.Println("encoding failed:", err)
+		}
+	})
+
+	log.Println("listening on http://localhost:4000 ...")
+	log.Fatal(http.ListenAndServe(":4000", mux))
+}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ curl localhost:4000/posts/1
+{"id":1,"title":"Go is pretty nice actually","score":42,"created_at":"2026-07-07T15:46:42Z"}</code></pre>
+</div>
+
+<ul>
+  <li><code>Title string `json:"title"`</code> — exported Go field <code>Title</code>, JSON key
+      <code>title</code>. <span class="hl y">Only exported (Capitalised) fields are encoded at all.</span></li>
+  <li><code>json.NewEncoder(w).Encode(post)</code> streams the JSON straight into the response.</li>
+  <li>Set <code>Content-Type: application/json</code> yourself — otherwise Go guesses
+      <code>text/plain</code> and picky clients sulk.</li>
+</ul>
+
+<div class="box deep">
+  <span class="box-title">Tag tricks you'll meet later in this book</span>
+  <p><code>json:"body,omitempty"</code> — drop the key entirely when the value is empty
+  (chapter 10, so link posts don't show <code>"body": ""</code>).<br>
+  <code>json:"-"</code> — <b>never</b> serialize this field (chapter 6, for password hashes).<br>
+  A pointer field like <code>*int64</code> — encodes as <code>null</code> when nil (chapter 11,
+  for “no parent comment”).</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>A handler is <code>func(w http.ResponseWriter, r *http.Request)</code> — read from r, write to w.</li>
+  <li>Route patterns: <code>"METHOD /path/{param}"</code>; grab params with <code>r.PathValue</code>.</li>
+  <li>Query strings via <code>r.URL.Query().Get</code>; absent = <code>""</code>.</li>
+  <li>Struct tags decide JSON key names; unexported fields never leave the building.</li>
+  <li>Always create your own <code>http.NewServeMux()</code>.</li>
+</ul>
+<p><b>Next up:</b> our playground files worked, but real projects need a spine — folders,
+config, logging, and a pattern for sharing dependencies without globals. Time to lay
+gopherit's foundation.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch01.html">← Ch 1 · Game Plan</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch03.html">Ch 3 · Skeleton →</a>
+</nav>
+
+</div>
+</body>
+</html>

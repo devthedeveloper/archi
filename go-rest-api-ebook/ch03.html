@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · A Real Project Skeleton — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch02.html">← Ch 2 · Hello, HTTP</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch04.html">Ch 4 · Speaking JSON →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#e6dbff"><small>chapter</small><span>3</span></div>
+  <div>
+    <h1>A Real Project Skeleton</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#7c5cff" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">folders that scale, an app struct instead of globals, flags &amp; structured logs</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>the <code>cmd/</code> + <code>internal/</code> layout used by serious Go projects</li>
+    <li>dependency injection with a plain struct (no magic, no globals)</li>
+    <li>configuration via flags and logging via <code>log/slog</code></li>
+    <li>why a bare <code>ListenAndServe</code> is never enough</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">From playground to project</span></h2>
+
+<p>Chapter 2's single files were fine for experiments, but gopherit will grow to ~15 files. Time to
+give it bones. <span class="hl y">This is the moment the real project starts</span> — everything from
+here to the last page builds on this skeleton.</p>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ mkdir -p gopherit/cmd/api gopherit/internal/store
+$ cd gopherit
+$ go mod init gopherit
+go: creating new go.mod: module gopherit</code></pre>
+</div>
+
+<div class="code-card"><span class="filename">the folder plan</span>
+<pre><code class="lang-bash">gopherit/
+├── go.mod                  # module name + dependency list
+├── cmd/
+│   └── api/                # package main — the HTTP layer
+│       ├── main.go         #   startup: config, logger, server
+│       ├── routes.go       #   the router, one page of URL patterns
+│       └── ...handlers     #   users.go, posts.go, ... (coming soon)
+└── internal/
+    └── store/              # the data layer — all SQL lives here (ch 5)</code></pre>
+</div>
+
+<ul>
+  <li><strong class="pen-v">cmd/api/</strong> — “the executable lives here.” If gopherit ever grows a
+      second binary (a CLI admin tool, say), it becomes <code>cmd/admin/</code>. Convention, not law —
+      but every Go developer recognises it on sight.</li>
+  <li><strong class="pen-t">internal/</strong> — this one <em>is</em> law: the Go compiler forbids any
+      other module from importing packages under <code>internal/</code>.
+      <span class="hl g">It's your “private” keyword for whole packages.</span></li>
+</ul>
+
+<h2><span class="swipe teal">The application struct — DI without a framework</span></h2>
+
+<p>Handlers need shared things: the logger, the config, soon a database. The rookie move is global
+variables; the enterprise move is a dependency-injection framework. Go's sweet spot is embarrassingly
+simple: <span class="hl y">put the shared stuff in one struct, and make your handlers methods on
+it</span>.</p>
+
+<div class="code-card"><span class="filename new">cmd/api/main.go</span>
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#L1-L57">// Chapter 3 checkpoint: the project skeleton, before the database
+// (chapter 5), JSON helpers (chapter 4) and graceful shutdown
+// (chapter 12) get added.
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"time"
+)
+
+const version = "0.1.0"
+
+// config holds everything tweakable from the outside world.
+type config struct {
+	port int
+	env  string
+}
+
+// application is the "toolbox" every handler can reach.
+// Handlers hang off it as methods, so they can use the logger and
+// config without any global variables.
+type application struct {
+	config config
+	logger *slog.Logger
+}
+
+func main() {
+	var cfg config
+	flag.IntVar(&amp;cfg.port, "port", 4000, "API server port")
+	flag.StringVar(&amp;cfg.env, "env", "development", "Environment (development|production)")
+	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	app := &amp;application{
+		config: cfg,
+		logger: logger,
+	}
+
+	srv := &amp;http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.port),
+		Handler:      app.routes(),
+		IdleTimeout:  time.Minute,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	logger.Info("starting server", "addr", srv.Addr, "env", cfg.env, "version", version)
+	err := srv.ListenAndServe()
+	logger.Error("server stopped", "error", err)
+	os.Exit(1)
+}</code></pre>
+</div>
+
+<p>Walk it slowly — this file is the template for every Go service you'll ever write:</p>
+<ul>
+  <li><strong>config</strong> is filled from command-line flags: <code>go run ./cmd/api -port 8080</code>.
+      Later you can read env vars into the same struct; handlers won't notice.</li>
+  <li><strong>slog</strong> is the standard structured logger — instead of a sentence, it logs
+      <code>key=value</code> pairs that log tools can search.</li>
+  <li><strong>application</strong> holds both. Because <code>healthzHandler</code> is a
+      <em>method</em> on it, the handler reaches the logger as <code>app.logger</code>. No globals,
+      and in tests we can build an <code>application</code> with fakes.</li>
+  <li>The <strong>http.Server struct</strong> replaces bare <code>ListenAndServe(addr, mux)</code>
+      so we can set timeouts. <span class="hl p">A server without timeouts lets one slow (or evil)
+      client hold a connection open forever</span> — set them once, forget them forever.</li>
+</ul>
+
+<div class="box warn">
+  <span class="box-title">The v0.1 fine print</span>
+  <p>When this server stops, it stops <em>hard</em> — in-flight requests get cut off. Good enough
+  while we build; in chapter 12 we'll teach it to shut down gracefully, finishing every request
+  before the lights go out.</p>
+</div>
+
+<h2><span class="swipe pink">Routes and the first real endpoint</span></h2>
+
+<p>The router gets its own file. It'll grow by a line or two per chapter, and having the whole URL
+map on one page is a gift to future-you:</p>
+
+<div class="code-card"><span class="filename new">cmd/api/routes.go</span>
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#func routes">// routes builds the router. It grows a line or two every chapter.
+func (app *application) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/healthz", app.healthzHandler)
+	return mux
+}</code></pre>
+</div>
+
+<p>And the health check — the “is anyone home?” endpoint every service needs (load balancers ping
+it, uptime bots ping it, you ping it at 2 a.m.):</p>
+
+<div class="code-card"><span class="filename new">cmd/api/healthz.go</span>
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#func healthzHandler">// healthzHandler — GET /api/v1/healthz
+func (app *application) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	data := map[string]string{
+		"status":      "available",
+		"environment": app.config.env,
+		"version":     version,
+	}
+
+	js, err := json.Marshal(data)
+	if err != nil {
+		app.logger.Error("marshal failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(js)
+}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go run ./cmd/api
+time=2026-07-07T15:43:41.614Z level=INFO msg="starting server" addr=:4000 env=development version=0.1.0
+
+# ...and from another terminal:
+$ curl localhost:4000/api/v1/healthz
+{"environment":"development","status":"available","version":"0.1.0"}</code></pre>
+</div>
+
+<span class="scribble o">it's alive!! ⚡ our project has a heartbeat</span>
+
+<div class="box deep">
+  <span class="box-title">Why /api/v1/ in every path?</span>
+  <p>The <code>v1</code> is an API <b>version</b>. The day you need to change a response shape in a
+  breaking way, you mount the new behaviour at <code>/api/v2/...</code> and old frontends keep
+  working against v1. Versioning is free to add on day one and miserable to retrofit on day 400.</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li><code>cmd/api</code> = the binary; <code>internal/</code> = compiler-enforced private packages.</li>
+  <li>Shared dependencies live in an <code>application</code> struct; handlers are its methods.</li>
+  <li>Config in via flags; logs out via <code>slog</code> with key=value pairs.</li>
+  <li>Always configure an <code>http.Server</code> with timeouts — never bare ListenAndServe.</li>
+  <li>Version your paths (<code>/api/v1/</code>) from day one.</li>
+</ul>
+<p><b>Next up:</b> our healthz handler hand-rolled its JSON — and every future handler would have to
+copy those ten lines. Let's build proper JSON machinery once, and never think about it again.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch02.html">← Ch 2 · Hello, HTTP</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch04.html">Ch 4 · Speaking JSON →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 8 · Middleware: the Onion — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch07.html">← Ch 7 · Login &amp; Tokens</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch09.html">Ch 9 · Subreddits →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#cdeeff"><small>chapter</small><span>8</span></div>
+  <div>
+    <h1>Middleware: the Onion</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#2f80ed" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">panic recovery, request logs, CORS for your future frontend, and the auth gate</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>the wrap-a-handler pattern behind every Go middleware ever written</li>
+    <li>four middlewares: recover, log, CORS, authenticate</li>
+    <li>smuggling the logged-in user through <code>context</code></li>
+    <li>why the wrapping <b>order</b> matters</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">One pattern, infinite middlewares</span></h2>
+
+<p>Some jobs apply to <em>every</em> request: logging, panic safety, CORS headers, checking tokens.
+Copy-pasting that into 12 handlers would be misery. Instead we wrap the whole router in layers —
+<span class="hl y">each layer does its bit, then calls the next one</span>. Requests travel inward
+through the onion, responses travel back out:</p>
+
+<div class="flow">
+  <div class="node o">recoverPanic</div>
+  <div class="arrow">⊃</div>
+  <div class="node v">logRequests</div>
+  <div class="arrow">⊃</div>
+  <div class="node b">enableCORS</div>
+  <div class="arrow">⊃</div>
+  <div class="node t">authenticate</div>
+  <div class="arrow">⊃</div>
+  <div class="node g">router<small>your handlers</small></div>
+</div>
+
+<p>And here is the entire trick — a function that takes a handler and returns a wrapped one:</p>
+
+<div class="code-card"><span class="filename">the shape of all middleware</span>
+<pre><code class="lang-go">func (app *application) myMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ... do things BEFORE the request is handled ...
+		next.ServeHTTP(w, r) // pass the baton inward
+		// ... do things AFTER (the response has been written) ...
+	})
+}</code></pre>
+</div>
+
+<p>That's a closure captured over <code>next</code>. No interfaces to implement, no framework
+registry — just functions eating functions. Now the four real ones:</p>
+
+<h2><span class="swipe teal">recoverPanic &amp; logRequests</span></h2>
+
+<div class="code-card"><span class="filename new">cmd/api/middleware.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func recoverPanic">// recoverPanic turns a panicking handler into a clean 500 response
+// instead of a dropped connection.
+func (app *application) recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				w.Header().Set("Connection", "close")
+				app.serverError(w, r, fmt.Errorf("panic: %v", err))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+</div>
+
+<p>Each request runs in its own goroutine; an unrecovered panic in one would print a stack trace
+and <span class="hl p">kill that connection with an empty reply</span>. This deferred
+<code>recover()</code> turns catastrophe into a tidy 500 — and because it's the outermost layer,
+it catches explosions in every layer beneath it.</p>
+
+<div class="code-card"><span class="filename">cmd/api/middleware.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func logRequests">// logRequests writes one structured log line per request.
+func (app *application) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		app.logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"took", time.Since(start).String())
+	})
+}</code></pre>
+</div>
+
+<p>Note the lines <em>around</em> <code>next.ServeHTTP</code>: start the clock before, log after.
+The middleware sandwich in action.</p>
+
+<h2><span class="swipe pink">enableCORS — the “bring your own frontend” switch</span></h2>
+
+<p>Remember the promise: any frontend can plug into gopherit. There's a catch — browsers enforce
+the <strong>same-origin policy</strong>: JavaScript served from <code>my-reddit-ui.com</code> is
+<em>not allowed</em> to call <code>api.gopherit.com</code>… unless the API explicitly says it's
+fine. That's <strong>CORS</strong> (Cross-Origin Resource Sharing), and it's just response
+headers:</p>
+
+<div class="code-card"><span class="filename">cmd/api/middleware.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func enableCORS">// enableCORS lets browser frontends on other origins call this API —
+// that's what makes gopherit "bring your own frontend".
+func (app *application) enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+
+		// Browsers send a "preflight" OPTIONS request before the real
+		// one. Answer it directly with 204 No Content.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+</div>
+
+<p>The <b>preflight</b> wrinkle: before sending a “risky” request (anything with an
+<code>Authorization</code> header, say), browsers first send an <code>OPTIONS</code> request asking
+“may I?”. We answer 204 with the allow-headers — watch:</p>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ curl -s -i -X OPTIONS localhost:4000/api/v1/posts
+HTTP/1.1 204 No Content
+Access-Control-Allow-Headers: Authorization, Content-Type
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Origin: *</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="box-title">The * is a development setting</span>
+  <p><code>Allow-Origin: *</code> means “any website may call me” — perfect while you and your
+  friends build frontends. A production API with cookies or private data should echo back a
+  <b>specific allowed origin</b> instead. One-line change in this one middleware — that's the
+  payoff of the onion.</p>
+</div>
+
+<h2><span class="swipe green">authenticate — reading the wristband</span></h2>
+
+<div class="code-card"><span class="filename">cmd/api/middleware.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func authenticate">// authenticate checks the Authorization header. No header = anonymous
+// visitor, carry on. A valid "Bearer &lt;token&gt;" = load the user and stash
+// them in the request context. A broken/expired token = 401 right here.
+func (app *application) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Authorization")
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			next.ServeHTTP(w, r) // anonymous is fine for public routes
+			return
+		}
+
+		token, ok := strings.CutPrefix(authHeader, "Bearer ")
+		if !ok || token == "" {
+			app.invalidCredentials(w)
+			return
+		}
+
+		user, err := app.store.UserForToken(token)
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				app.invalidCredentials(w)
+			default:
+				app.serverError(w, r, err)
+			}
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userContextKey, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}</code></pre>
+</div>
+
+<p>Three cases, three outcomes:</p>
+<ul>
+  <li><strong>No header</strong> → anonymous browsing is legal (reading feeds needs no account) — pass through.</li>
+  <li><strong>Valid token</strong> → load the user and <span class="hl y">stash them in the request's
+      context</span>, a per-request pocket that travels with <code>r</code> the rest of the way in.</li>
+  <li><strong>Broken or expired token</strong> → 401 on the spot; nothing deeper ever runs.</li>
+</ul>
+
+<div class="box gotcha">
+  <span class="box-title">Why the weird private contextKey type?</span>
+  <p><code>context.WithValue</code> is a shared pocket — any package could write a value under the
+  string key <code>"user"</code> and collide with ours. Keys of an <b>unexported type</b>
+  (<code>type contextKey string</code>) can't be forged from outside the package. It's the
+  documented idiom, promoted from folklore to convention.</p>
+</div>
+
+<p>Two small companions finish the story — a gate for routes that require login, and a getter
+handlers can call:</p>
+
+<div class="code-card"><span class="filename">cmd/api/middleware.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func requireAuth">// requireAuth guards a single route: no logged-in user, no entry.
+func (app *application) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if app.currentUser(r) == nil {
+			app.authRequired(w)
+			return
+		}
+		next(w, r)
+	}
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename">cmd/api/middleware.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/middleware.go#func currentUser">// currentUser fishes the logged-in user out of the request context.
+// Returns nil for anonymous requests.
+func (app *application) currentUser(r *http.Request) *store.User {
+	user, _ := r.Context().Value(userContextKey).(*store.User)
+	return user
+}</code></pre>
+</div>
+
+<h2><span class="swipe blue">Assemble the onion</span></h2>
+
+<p>The final routes.go — this is the file's finished form for the whole book, future endpoints
+included, so you can see the destination:</p>
+
+<div class="code-card"><span class="filename">cmd/api/routes.go — final</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/routes.go">package main
+
+import "net/http"
+
+// routes builds the router. Go 1.22+ ServeMux understands
+// "METHOD /path/{param}" patterns, so we need zero external packages.
+func (app *application) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Health
+	mux.HandleFunc("GET /api/v1/healthz", app.healthzHandler)
+
+	// Users &amp; auth
+	mux.HandleFunc("POST /api/v1/users", app.registerUserHandler)
+	mux.HandleFunc("POST /api/v1/tokens", app.loginHandler)
+
+	// Subreddits
+	mux.HandleFunc("GET /api/v1/subreddits", app.listSubredditsHandler)
+	mux.HandleFunc("POST /api/v1/subreddits", app.requireAuth(app.createSubredditHandler))
+	mux.HandleFunc("GET /api/v1/subreddits/{name}", app.getSubredditHandler)
+	mux.HandleFunc("GET /api/v1/subreddits/{name}/posts", app.listSubredditPostsHandler)
+
+	// Posts
+	mux.HandleFunc("GET /api/v1/posts", app.listPostsHandler)
+	mux.HandleFunc("POST /api/v1/posts", app.requireAuth(app.createPostHandler))
+	mux.HandleFunc("GET /api/v1/posts/{id}", app.getPostHandler)
+
+	// Comments &amp; votes
+	mux.HandleFunc("POST /api/v1/posts/{id}/comments", app.requireAuth(app.createCommentHandler))
+	mux.HandleFunc("POST /api/v1/posts/{id}/vote", app.requireAuth(app.votePostHandler))
+	mux.HandleFunc("POST /api/v1/comments/{id}/vote", app.requireAuth(app.voteCommentHandler))
+
+	// The middleware onion, outermost first: recover from panics, log
+	// every request, add CORS headers, then identify the caller.
+	return app.recoverPanic(app.logRequests(app.enableCORS(app.authenticate(mux))))
+}</code></pre>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Order matters — read the last line inside-out</span>
+  <p><code>recoverPanic(logRequests(enableCORS(authenticate(mux))))</code>:
+  recover is outermost so it catches panics from <em>everything</em>; logging next so even
+  CORS-rejected and 401'd requests get logged; authenticate is innermost because by then we know
+  the request is real. Swap recover inside authenticate and a panicking token lookup crashes the
+  connection unlogged. <span class="hl y">When in doubt: safety out, knowledge in.</span></p>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># no token on a 🔒 route — bounced at the gate:
+$ curl -s -i -X POST localhost:4000/api/v1/posts -d '{"subreddit":"golang","title":"sneaky"}'
+HTTP/1.1 401 Unauthorized
+Vary: Authorization
+
+{
+	"error": "you must be logged in to do this"
+}</code></pre>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Middleware = a function that wraps a handler and returns a handler. Sandwich code around <code>next.ServeHTTP</code>.</li>
+  <li>recoverPanic turns crashes into 500s; logRequests times every hit.</li>
+  <li>CORS headers are the permission slip browsers demand before your frontend may call the API.</li>
+  <li>authenticate parses the Bearer token and pockets the user in the request context.</li>
+  <li>Wrap order: recover → log → CORS → auth → router.</li>
+</ul>
+<p><b>Next up:</b> all the machinery exists. Time to mass-produce features — starting with
+communities.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch07.html">← Ch 7 · Login &amp; Tokens</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch09.html">Ch 9 · Subreddits →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 · The Game Plan — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="index.html">← Cover</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch02.html">Ch 2 · Hello, HTTP →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#ffe9d6"><small>chapter</small><span>1</span></div>
+  <div>
+    <h1>The Game Plan</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#ff5722" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">what a REST API actually is, and the map of everything we're about to build</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>how HTTP requests &amp; responses really look on the wire</li>
+    <li>what makes an API “RESTful” (it's simpler than it sounds)</li>
+    <li>the architecture and full endpoint map of <b>gopherit</b>, our Reddit clone</li>
+    <li>how to get your machine ready</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">So… what is an API?</span></h2>
+
+<p>Imagine Reddit with the skin peeled off. No orange buttons, no fonts, no dark mode. What's left
+is the part that actually <em>does things</em>: “create an account”, “fetch the hottest posts”,
+“add my comment to post 42”. An <strong>API</strong> (Application Programming Interface) is exactly
+that — <span class="hl y">a menu of actions a program offers to other programs</span>.</p>
+
+<p>A <strong>web API</strong> serves that menu over the internet using HTTP — the same protocol your
+browser uses to load pages. The conversation is always the same shape:</p>
+
+<div class="flow">
+  <div class="node b">client<small>browser, app, curl…</small></div>
+  <div class="arrow">— request ⟶</div>
+  <div class="node o">server<small>our Go program</small></div>
+  <div class="arrow">⟵ response —</div>
+  <div class="node b">client<small>renders the result</small></div>
+</div>
+
+<p>The client asks, the server answers, and then — this is important — <span class="hl p">the server
+forgets the conversation ever happened</span>. Every request must carry everything the server needs.
+That's what “stateless” means, and it's what makes APIs easy to scale.</p>
+
+<h2><span class="swipe teal">HTTP, dissected with a pocket knife</span></h2>
+
+<p>HTTP is plain text. Honestly, that's the whole secret. When a client asks Reddit for a post, the
+bytes that travel down the wire look like this:</p>
+
+<div class="code-card"><span class="filename">an HTTP request, raw</span>
+<pre><code class="lang-bash">POST /api/v1/posts HTTP/1.1
+Host: gopherit.example.com
+Authorization: Bearer JMY673HHZGM3UEPTFBNCZ4SQGP
+Content-Type: application/json
+
+{"subreddit": "golang", "title": "Go is fun!"}</code></pre>
+</div>
+
+<p>Read it top to bottom:</p>
+<ul>
+  <li><strong class="pen-o">POST</strong> — the <b>method</b>: what kind of action this is</li>
+  <li><strong class="pen-b">/api/v1/posts</strong> — the <b>path</b>: which thing the action targets</li>
+  <li><strong class="pen-v">Headers</strong> — metadata, one per line: who you are, what format you're sending…</li>
+  <li>a blank line, then the <strong class="pen-t">body</strong> — the actual payload, JSON for us</li>
+</ul>
+
+<p>And the server writes back the same kind of letter:</p>
+
+<div class="code-card"><span class="filename">an HTTP response, raw</span>
+<pre><code class="lang-bash">HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"post": {"id": 7, "title": "Go is fun!", "score": 0}}</code></pre>
+</div>
+
+<p>That <strong>201</strong> is a <b>status code</b> — a three-digit verdict. You'll use maybe ten of
+them your whole career:</p>
+
+<div class="tbl-scroll">
+<table class="notes">
+  <tr><th>Code</th><th>Means</th><th>gopherit uses it for</th></tr>
+  <tr><td><b class="pen-g">200 OK</b></td><td>here's what you asked for</td><td>fetching posts, feeds, votes</td></tr>
+  <tr><td><b class="pen-g">201 Created</b></td><td>made a new thing for you</td><td>new users, posts, comments</td></tr>
+  <tr><td><b class="pen-g">204 No Content</b></td><td>done, nothing to say</td><td>CORS preflight replies</td></tr>
+  <tr><td><b class="pen-o">400 Bad Request</b></td><td>I can't even parse that</td><td>broken JSON</td></tr>
+  <tr><td><b class="pen-o">401 Unauthorized</b></td><td>who are you? log in first</td><td>missing/expired token</td></tr>
+  <tr><td><b class="pen-o">404 Not Found</b></td><td>no such thing here</td><td>post 999999</td></tr>
+  <tr><td><b class="pen-o">405 Method Not Allowed</b></td><td>path exists, verb doesn't</td><td>DELETE on /posts</td></tr>
+  <tr><td><b class="pen-o">409 Conflict</b></td><td>clashes with existing data</td><td>username already taken</td></tr>
+  <tr><td><b class="pen-o">422 Unprocessable</b></td><td>parsed fine, values are wrong</td><td>password too short</td></tr>
+  <tr><td><b class="pen-p">500 Server Error</b></td><td>we broke, not you</td><td>bugs, dead database</td></tr>
+</table>
+</div>
+
+<span class="scribble t">rule of thumb: 4xx = the client messed up, 5xx = WE messed up 🙈</span>
+
+<h2><span class="swipe pink">REST in one paragraph (promise)</span></h2>
+
+<p><strong>REST</strong> (REpresentational State Transfer) sounds academic, but in practice it means
+five habits:</p>
+
+<ul class="checklist">
+  <li><strong>Everything is a resource with a URL.</strong> A post lives at
+      <code>/api/v1/posts/42</code>. A community lives at <code>/api/v1/subreddits/golang</code>.</li>
+  <li><strong>URLs are nouns, methods are verbs.</strong> Not <code>/getPost?id=42</code> —
+      instead <span class="hl g">GET /posts/42</span>. Not <code>/deletePost</code> — DELETE /posts/42.</li>
+  <li><strong>Use HTTP's vocabulary.</strong> GET reads, POST creates, PUT/PATCH updates,
+      DELETE deletes. Status codes carry the verdict.</li>
+  <li><strong>Stateless.</strong> Every request stands alone, carrying its own auth token.</li>
+  <li><strong>JSON in, JSON out.</strong> (REST doesn't require JSON, but the industry decided.)</li>
+</ul>
+
+<div class="box gotcha">
+  <span class="box-title">Spot the smell</span>
+  <p><code>POST /api/createNewPostForUser?userId=7</code> — verbs in the URL, user in a query param,
+  action instead of resource. The RESTful version: <code>POST /api/v1/posts</code> with the user
+  identified by their auth token. Same feature, much cleaner contract.</p>
+</div>
+
+<h2><span class="swipe green">Meet gopherit 🐹</span></h2>
+
+<p>Over the next eleven chapters we'll build <strong class="pen-o">gopherit</strong> — the complete
+backend of a Reddit clone. Users, communities, posts, nested comments, voting, hot ranking, auth,
+CORS, tests. <span class="hl y">Backend only, on purpose:</span> when we're done, the API is a clean
+socket that <em>any</em> frontend can plug into — a React site, a Flutter app, a terminal client,
+or just <code>curl</code>. Your Reddit, your rules.</p>
+
+<p>Here's the architecture. We keep it to <strong>two layers</strong> plus a database — small enough
+to hold in your head, big enough to teach you how real services are shaped:</p>
+
+<div class="flow">
+  <div class="node v">handlers<small>cmd/api — HTTP in/out,<br>validation, status codes</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node t">store<small>internal/store — all SQL,<br>returns Go structs</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node g">SQLite<small>gopherit.db,<br>one file on disk</small></div>
+</div>
+
+<div class="box tip">
+  <span class="box-title">Why layers?</span>
+  <p>Handlers know about HTTP but never touch SQL. The store knows SQL but has no idea HTTP exists.
+  When you later swap SQLite for Postgres — or bolt on a CLI that skips HTTP entirely — you only
+  touch one layer. This separation is 80% of “clean architecture” with 20% of the ceremony.</p>
+</div>
+
+<p>And the tech list is refreshingly short:</p>
+
+<div class="tbl-scroll">
+<table class="notes">
+  <tr><th>Need</th><th>We use</th><th>Not</th></tr>
+  <tr><td>HTTP server &amp; routing</td><td><code>net/http</code> (std lib, Go 1.22+ patterns)</td><td>gin, echo, chi, fiber…</td></tr>
+  <tr><td>Database</td><td>SQLite via <code>modernc.org/sqlite</code> (pure Go)</td><td>Postgres + docker + ORM</td></tr>
+  <tr><td>Passwords</td><td><code>golang.org/x/crypto/bcrypt</code></td><td>rolling our own 💀</td></tr>
+  <tr><td>Logging</td><td><code>log/slog</code> (std lib)</td><td>zap, logrus</td></tr>
+  <tr><td>Tests</td><td><code>net/http/httptest</code> (std lib)</td><td>testing frameworks</td></tr>
+</table>
+</div>
+
+<div class="box deep">
+  <span class="box-title">Why no framework? Seriously?</span>
+  <p>In most languages you need a framework because the standard library is bare. Go is the
+  opposite: <code>net/http</code> ships a production-grade server, and since Go 1.22 the built-in
+  router understands methods and path parameters. Learning the std lib first means every Go
+  framework you meet later (they all wrap <code>net/http</code>) will feel familiar — not magical.</p>
+</div>
+
+<h2><span class="swipe blue">Get your desk ready</span></h2>
+
+<ol>
+  <li><strong>Install Go 1.24 or newer</strong> from <a href="https://go.dev/dl/">go.dev/dl</a>, then check:</li>
+</ol>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ go version
+go version go1.24.7 linux/amd64</code></pre>
+</div>
+
+<ol start="2">
+  <li><strong>Make a project folder.</strong> We'll initialise the module properly in chapter 3:</li>
+</ol>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ mkdir gopherit && cd gopherit</code></pre>
+</div>
+
+<ol start="3">
+  <li><strong>Have <code>curl</code> handy</strong> (preinstalled on macOS/Linux, ships with Windows 10+).
+  Prefer a GUI? Postman, Insomnia, Bruno or the VS Code REST Client all work — the book shows
+  <code>curl</code> because it's copy-pasteable.</li>
+</ol>
+
+<div class="sticky green">
+  <h4>Go a bit rusty? 🦫</h4>
+  <p>This book assumes you can read structs, functions, and <code>if err != nil</code>. For anything
+  that slips your mind, keep the <a href="https://github.com/devthedeveloper/gocheatsheet">gocheatsheet</a>
+  open next to this book — especially its <b>structs</b>, <b>errors</b> and <b>JSON</b> sections.</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>HTTP is plain text: <b>method + path + headers + body</b> in, <b>status + headers + body</b> out.</li>
+  <li>REST = resources as URLs, HTTP methods as verbs, stateless requests, JSON bodies.</li>
+  <li>4xx means the client goofed; 5xx means we goofed.</li>
+  <li>gopherit = handlers layer (HTTP) → store layer (SQL) → SQLite (a file).</li>
+  <li>No frameworks. The standard library carries us the whole way.</li>
+</ul>
+<p><b>Next up:</b> we stop reading and start typing — a working Go web server in about 15 lines.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="index.html">← Cover</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch02.html">Ch 2 · Hello, HTTP →</a>
+</nav>
+
+</div>
+</body>
+</html>

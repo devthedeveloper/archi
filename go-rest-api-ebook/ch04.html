@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · Speaking JSON — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch03.html">← Ch 3 · Skeleton</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch05.html">Ch 5 · Database →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#fff8b8"><small>chapter</small><span>4</span></div>
+  <div>
+    <h1>Speaking JSON Like a Pro</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#f5b301" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">write-once helpers for responses, bullet-proof request reading, and friendly errors</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>the <b>envelope</b> pattern for consistent responses</li>
+    <li>a strict <code>readJSON</code> that turns decoder gibberish into helpful messages</li>
+    <li>one tidy helper per error status — used by every future handler</li>
+    <li>a 10-line validation tool we'll use all book long</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Envelopes: never ship naked JSON</span></h2>
+
+<p>gopherit's responses always wrap their payload under a named key:
+<code>{"post": {...}}</code>, <code>{"posts": [...], "meta": {...}}</code>, <code>{"error": "..."}</code>.
+That wrapper is called an <strong>envelope</strong>, and it buys three things:
+the response is <span class="hl y">self-describing</span>, you can
+<span class="hl g">add siblings later</span> (like <code>meta</code>) without breaking clients, and
+a top-level JSON <em>array</em> never happens (an old browser-security footgun).
+In Go, an envelope is just a friendly alias:</p>
+
+<div class="code-card"><span class="filename new">cmd/api/helpers.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/helpers.go#L1-L16">package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+
+	"gopherit/internal/store"
+)
+
+// envelope wraps every response, so JSON always has a named top-level
+// key: {"post": {...}} instead of a bare {...}.
+type envelope map[string]any</code></pre>
+</div>
+
+<h2><span class="swipe teal">writeJSON — the only place that encodes</span></h2>
+
+<div class="code-card"><span class="filename">cmd/api/helpers.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/helpers.go#func writeJSON">// writeJSON sends data as pretty-printed JSON with the given status code.
+func (app *application) writeJSON(w http.ResponseWriter, status int, data envelope) {
+	js, err := json.MarshalIndent(data, "", "\t")
+	if err != nil {
+		app.logger.Error("writeJSON failed", "error", err)
+		http.Error(w, `{"error":"the server encountered a problem"}`, http.StatusInternalServerError)
+		return
+	}
+	js = append(js, '\n')
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(js)
+}</code></pre>
+</div>
+
+<ul>
+  <li><code>MarshalIndent</code> pretty-prints with tabs — humans read API responses during
+      development a thousand times; machines don't care either way.</li>
+  <li>If marshalling itself fails (rare — a channel in a struct, say), we log the real error and
+      send a plain 500. <span class="hl p">The client never sees Go's internal error text.</span></li>
+  <li>Note the order from chapter 2 honored: header → status → body.</li>
+</ul>
+
+<h2><span class="swipe pink">readJSON — trust no body</span></h2>
+
+<p>Reading is where APIs get hurt. Clients send 100&nbsp;MB bodies, misspelled fields, two JSON
+documents glued together, or nothing at all. Our <code>readJSON</code> is strict about all of it,
+and — just as important — <span class="hl y">translates every cryptic decoder error into a sentence
+a frontend developer can act on</span>:</p>
+
+<div class="code-card"><span class="filename">cmd/api/helpers.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/helpers.go#func readJSON">// readJSON decodes the request body into dst — strictly. It rejects
+// bodies over 1 MB, unknown fields, trailing garbage and empty bodies,
+// and turns the decoder's cryptic errors into human-friendly messages.
+func (app *application) readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1_048_576) // 1 MB cap
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(dst); err != nil {
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		var maxBytesErr *http.MaxBytesError
+
+		switch {
+		case errors.As(err, &amp;syntaxErr):
+			return fmt.Errorf("body contains badly-formed JSON (at character %d)", syntaxErr.Offset)
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			return errors.New("body contains badly-formed JSON")
+		case errors.As(err, &amp;typeErr):
+			if typeErr.Field != "" {
+				return fmt.Errorf("body contains incorrect JSON type for field %q", typeErr.Field)
+			}
+			return fmt.Errorf("body contains incorrect JSON type (at character %d)", typeErr.Offset)
+		case errors.Is(err, io.EOF):
+			return errors.New("body must not be empty")
+		case errors.As(err, &amp;maxBytesErr):
+			return fmt.Errorf("body must not be larger than %d bytes", maxBytesErr.Limit)
+		default:
+			return err
+		}
+	}
+
+	// A second Decode should hit EOF. If not, there was extra JSON.
+	if err := dec.Decode(&amp;struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("body must only contain a single JSON value")
+	}
+	return nil
+}</code></pre>
+</div>
+
+<p>The four guards, in order of appearance:</p>
+<div class="tbl-scroll">
+<table class="notes">
+  <tr><th>Guard</th><th>Blocks</th></tr>
+  <tr><td><code>http.MaxBytesReader</code></td><td>gigabyte bodies eating your RAM — hard 1 MB cap</td></tr>
+  <tr><td><code>DisallowUnknownFields</code></td><td>typos like <code>"usrname"</code> silently vanishing — they 400 instead</td></tr>
+  <tr><td>the <code>errors.As/Is</code> switch</td><td>raw decoder errors leaking to clients — friendly text instead</td></tr>
+  <tr><td>the second <code>Decode</code></td><td>trailing garbage: <code>{"a":1}{"b":2}</code> must be one value</td></tr>
+</table>
+</div>
+
+<div class="box deep">
+  <span class="box-title">errors.Is vs errors.As — thirty-second refresher</span>
+  <p><code>errors.Is(err, io.EOF)</code> asks “is this error (or anything it wraps)
+  <em>equal to</em> that sentinel value?” <code>errors.As(err, &amp;syntaxErr)</code> asks “is there a
+  <code>*json.SyntaxError</code> hiding anywhere in this chain? If yes, unpack it into my variable so
+  I can read its fields” — that's how we get the character offset into the message.</p>
+</div>
+
+<h2><span class="swipe green">One helper per error — errors.go</span></h2>
+
+<p>Every error the API can send gets a tiny, well-named method. Handlers will read like English:
+<code>app.notFound(w)</code>, <code>app.conflict(w, "...")</code>:</p>
+
+<div class="code-card"><span class="filename new">cmd/api/errors.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/errors.go">package main
+
+import "net/http"
+
+// errorResponse is the single place that shapes error JSON. Every error
+// the API ever returns looks like {"error": ...}.
+func (app *application) errorResponse(w http.ResponseWriter, status int, message any) {
+	app.writeJSON(w, status, envelope{"error": message})
+}
+
+// serverError = 500. Log the gory details, tell the client very little.
+func (app *application) serverError(w http.ResponseWriter, r *http.Request, err error) {
+	app.logger.Error("server error", "method", r.Method, "url", r.URL.String(), "error", err)
+	app.errorResponse(w, http.StatusInternalServerError,
+		"the server encountered a problem and could not process your request")
+}
+
+// badRequest = 400: the client sent something we couldn't even parse.
+func (app *application) badRequest(w http.ResponseWriter, err error) {
+	app.errorResponse(w, http.StatusBadRequest, err.Error())
+}
+
+// notFound = 404.
+func (app *application) notFound(w http.ResponseWriter) {
+	app.errorResponse(w, http.StatusNotFound, "the requested resource could not be found")
+}
+
+// failedValidation = 422: parseable, but the values were wrong.
+func (app *application) failedValidation(w http.ResponseWriter, p problems) {
+	app.errorResponse(w, http.StatusUnprocessableEntity, p)
+}
+
+// conflict = 409: e.g. username already taken.
+func (app *application) conflict(w http.ResponseWriter, message string) {
+	app.errorResponse(w, http.StatusConflict, message)
+}
+
+// invalidCredentials = 401 for a wrong email/password or a bad token.
+func (app *application) invalidCredentials(w http.ResponseWriter) {
+	app.errorResponse(w, http.StatusUnauthorized, "invalid credentials")
+}
+
+// authRequired = 401 for "you need to log in first".
+func (app *application) authRequired(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	app.errorResponse(w, http.StatusUnauthorized, "you must be logged in to do this")
+}</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="box-title">The golden rule of 500s</span>
+  <p>Look at <code>serverError</code>: the <em>log</em> gets the full story (method, URL, the real
+  error); the <em>client</em> gets a bland apology. Detailed errors in responses are a gift to
+  attackers and a lawsuit in some industries. <span class="hl y">Log loud, respond vague.</span></p>
+</div>
+
+<h2><span class="swipe blue">A validator in ten lines</span></h2>
+
+<p>Frameworks ship validation DSLs with a hundred rules. We need exactly one idea: collect
+<em>all</em> the problems with a request, then report them together (nobody enjoys fixing one field
+per submit):</p>
+
+<div class="code-card"><span class="filename">cmd/api/helpers.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/helpers.go#L82-L93">// problems collects validation failures: field name -&gt; what's wrong.
+type problems map[string]string
+
+// check records a problem when ok is false. The first message for a
+// field wins, so order your checks from most to least important.
+func (p problems) check(ok bool, field, message string) {
+	if !ok {
+		if _, exists := p[field]; !exists {
+			p[field] = message
+		}
+	}
+}</code></pre>
+</div>
+
+<p>Usage reads like a checklist — you'll see it for real in chapter 6:</p>
+
+<div class="code-card"><span class="filename">how it'll look in handlers</span>
+<pre><code class="lang-go">p := make(problems)
+p.check(len(input.Username) >= 3, "username", "must be at least 3 characters")
+p.check(len(input.Password) >= 8, "password", "must be at least 8 characters")
+if len(p) > 0 {
+	app.failedValidation(w, p) // 422 with the whole map
+	return
+}</code></pre>
+</div>
+
+<h2><span class="swipe">Upgrade healthz &amp; take it all for a spin</span></h2>
+
+<p>Our chapter-3 healthz hand-rolled its JSON. Now it shrinks to its final form:</p>
+
+<div class="code-card"><span class="filename">cmd/api/healthz.go — final</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/healthz.go">package main
+
+import "net/http"
+
+// healthzHandler answers "is the API alive?" — handy for load balancers,
+// uptime monitors, and your own sanity while developing.
+func (app *application) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	app.writeJSON(w, http.StatusOK, envelope{
+		"status":      "available",
+		"environment": app.config.env,
+		"version":     version,
+	})
+}</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># pretty, enveloped healthz:
+$ curl localhost:4000/api/v1/healthz
+{
+	"environment": "development",
+	"status": "available",
+	"version": "1.0.0"
+}
+
+# our helpers already speak for the whole API — send it garbage:
+$ curl -X POST localhost:4000/api/v1/users -d '{oops'
+{
+	"error": "body contains badly-formed JSON (at character 2)"
+}
+
+$ curl -X POST localhost:4000/api/v1/users -d '{"usrname":"ada"}'
+{
+	"error": "json: unknown field \"usrname\""
+}
+
+$ curl localhost:4000/api/v1/posts/999
+{
+	"error": "the requested resource could not be found"
+}</code></pre>
+</div>
+
+<span class="scribble v">every error, same shape: {"error": ...} — frontends only need ONE error handler 🎯</span>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Wrap every response in an envelope: <code>{"user": ...}</code>, <code>{"error": ...}</code>.</li>
+  <li><code>writeJSON</code> and <code>readJSON</code> exist once; handlers never touch the encoder again.</li>
+  <li>Cap body size, reject unknown fields, translate decoder errors for humans.</li>
+  <li>500s: log the details, hide them from clients.</li>
+  <li><code>problems.check(...)</code> collects all validation failures for one 422.</li>
+</ul>
+<p><b>Next up:</b> everything so far vanishes when the process exits. gopherit needs a memory —
+a real database, in a single file, with zero installation drama.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch03.html">← Ch 3 · Skeleton</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch05.html">Ch 5 · Database →</a>
+</nav>
+
+</div>
+</body>
+</html>

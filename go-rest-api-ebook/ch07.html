@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Login &amp; Tokens — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch06.html">← Ch 6 · Users</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch08.html">Ch 8 · Middleware →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#ffe1c9"><small>chapter</small><span>7</span></div>
+  <div>
+    <h1>Login &amp; Bearer Tokens</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#ff5722" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">mint them, hash them, expire them — auth that a whole team can reason about</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>how token auth works end-to-end (the wristband model 🎟️)</li>
+    <li>minting cryptographically random tokens — and why we store only their hash</li>
+    <li>the login endpoint, and defeating “user enumeration”</li>
+    <li>where JWTs fit in (and why we're not using them here)</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">The wristband model</span></h2>
+
+<p>HTTP is stateless — chapter 1's forgetful server. So how does “being logged in” work? The same
+way a music festival works:</p>
+
+<div class="flow">
+  <div class="node b">show ID once<small>email + password<br>POST /tokens</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node o">get a wristband<small>a random token,<br>expires in 7 days</small></div>
+  <div class="arrow">⟶</div>
+  <div class="node t">flash it at every gate<small>Authorization: Bearer …<br>on each request</small></div>
+</div>
+
+<p>The client (browser, app, curl) keeps the token and attaches it to every request in a header:</p>
+
+<div class="code-card"><span class="filename">the header, exactly</span>
+<pre><code class="lang-bash">Authorization: Bearer JMY673HHZGM3UEPTFBNCZ4SQGP</code></pre>
+</div>
+
+<p>“Bearer” means <em>whoever bears this token is treated as its owner</em> — which is why tokens
+travel only over HTTPS in production, and why they expire.</p>
+
+<h2><span class="swipe teal">Minting tokens — and hashing them too</span></h2>
+
+<div class="code-card"><span class="filename new">internal/store/tokens.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/tokens.go">package store
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"time"
+)
+
+// CreateToken mints a random bearer token for a user. The client gets the
+// plaintext; we keep only a SHA-256 hash, so a stolen database does not
+// hand out working logins.
+func (s *Store) CreateToken(userID int64, ttl time.Duration) (plaintext, expiresAt string, err error) {
+	plaintext = rand.Text() // 26 chars of crypto-random base32 (Go 1.24+)
+	hash := sha256.Sum256([]byte(plaintext))
+	expiresAt = time.Now().UTC().Add(ttl).Format(time.RFC3339)
+
+	_, err = s.db.Exec(`
+        INSERT INTO tokens (hash, user_id, expires_at)
+        VALUES (?, ?, ?)`,
+		hash[:], userID, expiresAt)
+	if err != nil {
+		return "", "", err
+	}
+	return plaintext, expiresAt, nil
+}
+
+// UserForToken exchanges a plaintext bearer token for the user it belongs
+// to. Returns ErrNotFound for unknown or expired tokens.
+func (s *Store) UserForToken(plaintext string) (*User, error) {
+	hash := sha256.Sum256([]byte(plaintext))
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var u User
+	err := s.db.QueryRow(`
+        SELECT u.id, u.username, u.email, u.created_at
+        FROM tokens t
+        JOIN users  u ON u.id = t.user_id
+        WHERE t.hash = ? AND t.expires_at &gt; ?`,
+		hash[:], now,
+	).Scan(&amp;u.ID, &amp;u.Username, &amp;u.Email, &amp;u.CreatedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &amp;u, nil
+}</code></pre>
+</div>
+
+<ul>
+  <li><code>rand.Text()</code> (Go 1.24+, from <code>crypto/rand</code>) returns 26 characters of
+      <span class="hl y">cryptographically secure</span> randomness — ~128 bits, unguessable.
+      <em>Never</em> use <code>math/rand</code> for anything security-shaped; it's predictable by design.</li>
+  <li>We store <strong>SHA-256(token)</strong>, not the token. Wait — chapter 6 said fast hashes are
+      bad?! For <em>passwords</em>, yes: humans pick guessable ones, so hashing must be slow. A
+      128-bit random token is un-bruteforceable no matter how fast the hash — SHA-256 is safe here,
+      and adds zero login latency. <span class="hl g">If the DB leaks, the thief holds hashes that
+      open nothing.</span></li>
+  <li>The expiry check rides on chapter 5's trick: RFC-3339 UTC strings compare correctly as plain
+      strings, so <code>expires_at &gt; ?</code> needs no date math at all.</li>
+</ul>
+
+<h2><span class="swipe pink">The login endpoint</span></h2>
+
+<div class="code-card"><span class="filename">cmd/api/users.go — add</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/users.go#func loginHandler">// loginHandler — POST /api/v1/tokens
+// Body: {"email": "...", "password": "..."}
+// Trades valid credentials for a bearer token that lasts 7 days.
+func (app *application) loginHandler(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	user, err := app.store.UserByEmail(strings.TrimSpace(strings.ToLower(input.Email)))
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			// Same reply as a wrong password — don't reveal which
+			// emails have accounts.
+			app.invalidCredentials(w)
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword(user.PasswordHash, []byte(input.Password))
+	if err != nil {
+		app.invalidCredentials(w)
+		return
+	}
+
+	token, expiresAt, err := app.store.CreateToken(user.ID, 7*24*time.Hour)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.writeJSON(w, http.StatusCreated, envelope{
+		"token":      token,
+		"expires_at": expiresAt,
+		"user":       user,
+	})
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="box-title">The identical-errors trick (user enumeration)</span>
+  <p>Unknown email and wrong password return the <em>same</em> 401 “invalid credentials”. If they
+  differed, an attacker could probe <code>POST /tokens</code> with a list of emails and learn which
+  ones have accounts here — that's called <b>user enumeration</b>, and it's how “haveibeenpwned”
+  lists get cross-referenced. One boring shared message closes the door.</p>
+</div>
+
+<p>Route it, then log in:</p>
+
+<div class="code-card"><span class="filename">cmd/api/routes.go — add</span>
+<pre><code class="lang-go">mux.HandleFunc("POST /api/v1/tokens", app.loginHandler)</code></pre>
+</div>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash">$ curl -s -X POST localhost:4000/api/v1/tokens \
+    -d '{"email":"ada@example.com","password":"correct-horse-battery"}'
+{
+	"expires_at": "2026-07-14T15:35:44Z",
+	"token": "JMY673HHZGM3UEPTFBNCZ4SQGP",
+	"user": {
+		"id": 1,
+		"username": "ada",
+		"email": "ada@example.com",
+		"created_at": "2026-07-07T15:35:44Z"
+	}
+}
+
+# wrong password — and an unknown email replies EXACTLY the same:
+$ curl -s -X POST localhost:4000/api/v1/tokens \
+    -d '{"email":"ada@example.com","password":"guess"}'
+{
+	"error": "invalid credentials"
+}</code></pre>
+</div>
+
+<span class="scribble t">save that token — from now on it goes in the Authorization header of every 🔒 request</span>
+
+<div class="box deep">
+  <span class="box-title">“Why not JWT?” — the interview question</span>
+  <p><b>JWTs</b> are <em>self-contained</em> tokens: the server signs a blob of claims and verifies
+  the signature later — no database lookup. Great for microservices where one auth service issues
+  tokens that ten other services verify.</p>
+  <p>The cost: <span class="hl p">a JWT can't be revoked</span> — until it expires, a stolen one
+  works even after “logout” (unless you add a denylist… which is a database lookup, defeating the
+  point). Add algorithm-confusion attacks, clock skew, and key rotation, and JWTs carry real
+  footguns.</p>
+  <p>Our <b>stateful tokens</b> cost one indexed SELECT per request and give us instant revocation
+  (<code>DELETE FROM tokens</code> = logged out everywhere), trivial code, and nothing to
+  misconfigure. For a single-service API, that's the sweet spot. Learn JWTs when your architecture
+  actually needs them — you'll recognize the moment.</p>
+</div>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Login = trade credentials for a random bearer token; send it in <code>Authorization: Bearer …</code>.</li>
+  <li>Random tokens: <code>crypto/rand</code> always. Store the SHA-256, never the plaintext.</li>
+  <li>Fast hash for random tokens, slow hash for human passwords — different threats.</li>
+  <li>Unknown email and wrong password must be indistinguishable (401 “invalid credentials”).</li>
+  <li>Stateful tokens = revocable + simple. JWTs shine across service boundaries, not here.</li>
+</ul>
+<p><b>Next up:</b> ada has a wristband, but no gate actually checks it yet. Middleware time — the
+most elegant pattern in Go web development.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch06.html">← Ch 6 · Users</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch08.html">Ch 8 · Middleware →</a>
+</nav>
+
+</div>
+</body>
+</html>

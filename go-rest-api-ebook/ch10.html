@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 10 · Posts &amp; Feeds — Go + REST</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="notes.css">
+<script src="notes.js" defer></script>
+</head>
+<body>
+<div class="sheet">
+
+<nav class="booknav">
+  <a href="ch09.html">← Ch 9 · Subreddits</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch11.html">Ch 11 · Comments &amp; Votes →</a>
+</nav>
+
+<header class="chapter-head">
+  <div class="ch-sticker" style="--sticker:#e6dbff"><small>chapter</small><span>10</span></div>
+  <div>
+    <h1>Posts &amp; Feeds</h1>
+    <svg class="squiggle" viewBox="0 0 420 14" aria-hidden="true"><path d="M4 9 Q 40 2, 80 8 T 160 8 T 240 7 T 320 9 T 416 6" fill="none" stroke="#7c5cff" stroke-width="4" stroke-linecap="round"/></svg>
+    <p class="subtitle">text vs link posts, pagination with receipts, and the hot-ranking formula</p>
+  </div>
+</header>
+
+<div class="sticky">
+  <h4>In this chapter you'll learn ✍️</h4>
+  <ul>
+    <li>modeling two flavors of post (text / link) in one table</li>
+    <li>JOINs that turn ids into names the frontend actually wants</li>
+    <li>pagination done honestly: LIMIT/OFFSET + a meta object</li>
+    <li>Reddit-style <b>hot</b> sorting — score vs. age, with real math</li>
+  </ul>
+</div>
+
+<h2><span class="swipe">Two kinds of post, one table</span></h2>
+
+<p>Reddit has text posts (“AMA!”) and link posts (a URL pointing elsewhere). Rather than two
+tables, we give <code>posts</code> both a <code>body</code> and a <code>url</code> column and add a
+rule: <span class="hl y">a post fills one or the other, never both</span>. The validation lives in
+the handler; the JSON stays clean because both fields are <code>omitempty</code>.</p>
+
+<div class="code-card"><span class="filename new">internal/store/posts.go</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/posts.go#L1-L38">package store
+
+import (
+	"database/sql"
+	"errors"
+)
+
+// Post is one submission in a subreddit. Body and URL are omitempty so a
+// link post doesn't show "body": "" and a text post doesn't show "url": "".
+type Post struct {
+	ID           int64  `json:"id"`
+	Title        string `json:"title"`
+	Body         string `json:"body,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Score        int64  `json:"score"`
+	CommentCount int64  `json:"comment_count"`
+	Author       string `json:"author"`
+	Subreddit    string `json:"subreddit"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// PostFilters carries everything a feed query needs: which community
+// (0 = all of them), how to sort, and which page to return.
+type PostFilters struct {
+	SubredditID int64
+	Sort        string // "new", "top" or "hot"
+	Page        int
+	PageSize    int
+}
+
+// Meta describes the page of results that came back, so clients can
+// render pagination controls.
+type Meta struct {
+	Page       int   `json:"page"`
+	PageSize   int   `json:"page_size"`
+	Total      int64 `json:"total"`
+	TotalPages int64 `json:"total_pages"`
+}</code></pre>
+</div>
+
+<h2><span class="swipe teal">Creating and fetching — JOINs earn their keep</span></h2>
+
+<div class="code-card"><span class="filename">internal/store/posts.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/posts.go#func CreatePost">// CreatePost inserts a post and returns it fully hydrated (with author
+// and subreddit names attached).
+func (s *Store) CreatePost(subredditID, authorID int64, title, body, url string) (*Post, error) {
+	var id int64
+	err := s.db.QueryRow(`
+        INSERT INTO posts (subreddit_id, author_id, title, body, url)
+        VALUES (?, ?, ?, ?, ?)
+        RETURNING id`,
+		subredditID, authorID, title, body, url,
+	).Scan(&amp;id)
+	if err != nil {
+		return nil, err
+	}
+	return s.PostByID(id)
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename">internal/store/posts.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/posts.go#func PostByID">// PostByID fetches a single post. Returns ErrNotFound if it doesn't exist.
+func (s *Store) PostByID(id int64) (*Post, error) {
+	var p Post
+	err := s.db.QueryRow(`
+        SELECT p.id, p.title, p.body, p.url, p.score, p.created_at,
+               u.username, sr.name,
+               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)
+        FROM posts p
+        JOIN users      u  ON u.id  = p.author_id
+        JOIN subreddits sr ON sr.id = p.subreddit_id
+        WHERE p.id = ?`,
+		id,
+	).Scan(&amp;p.ID, &amp;p.Title, &amp;p.Body, &amp;p.URL, &amp;p.Score, &amp;p.CreatedAt,
+		&amp;p.Author, &amp;p.Subreddit, &amp;p.CommentCount)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &amp;p, nil
+}</code></pre>
+</div>
+
+<p>The posts table stores <code>author_id = 2</code>, but no frontend wants to make a second
+request to learn that 2 means “linus”. The two <strong>JOINs</strong> stitch usernames and
+subreddit names into the row on the way out, and the <strong>subquery</strong> counts comments —
+one query, one round-trip, everything a post card on screen needs.</p>
+
+<h2><span class="swipe pink">The feed — pagination with receipts</span></h2>
+
+<p>Feeds can't return every post since the dawn of time. Clients ask for a slice —
+<code>?page=3&amp;page_size=20</code> — and SQL slices with
+<code>LIMIT page_size OFFSET (page-1)*page_size</code>. But a bare array leaves the frontend
+guessing: <em>is there a next page? how many total?</em> So gopherit always ships a
+<span class="hl g">meta receipt</span> alongside:</p>
+
+<div class="code-card"><span class="filename">internal/store/posts.go (continued)</span>
+<pre><code class="lang-go" data-src="gopherit:internal/store/posts.go#func ListPosts">// ListPosts returns one page of the feed plus pagination metadata.
+//
+// The "hot" sort is the fun part: score divided by (age in hours + 2)
+// raised to 1.5 — fresh posts with a few votes beat old posts with many.
+// The +2 stops brand-new posts from dividing by (almost) zero.
+func (s *Store) ListPosts(f PostFilters) ([]Post, Meta, error) {
+	orderBy := map[string]string{
+		"new": "p.id DESC",
+		"top": "p.score DESC, p.id DESC",
+		"hot": "hotness DESC, p.id DESC",
+	}[f.Sort]
+	if orderBy == "" {
+		orderBy = "p.id DESC"
+	}
+
+	// COUNT(*) OVER() is a window function: it stamps the total number of
+	// matching rows onto every row, so one query gives us data + total.
+	query := `
+        SELECT p.id, p.title, p.body, p.url, p.score, p.created_at,
+               u.username, sr.name,
+               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id),
+               CAST(p.score AS REAL) /
+                   pow((julianday('now') - julianday(p.created_at)) * 24.0 + 2.0, 1.5)
+                   AS hotness,
+               COUNT(*) OVER() AS total
+        FROM posts p
+        JOIN users      u  ON u.id  = p.author_id
+        JOIN subreddits sr ON sr.id = p.subreddit_id
+        WHERE (? = 0 OR p.subreddit_id = ?)
+        ORDER BY ` + orderBy + `
+        LIMIT ? OFFSET ?`
+
+	offset := (f.Page - 1) * f.PageSize
+	rows, err := s.db.Query(query, f.SubredditID, f.SubredditID, f.PageSize, offset)
+	if err != nil {
+		return nil, Meta{}, err
+	}
+	defer rows.Close()
+
+	posts := []Post{}
+	var total int64
+	for rows.Next() {
+		var p Post
+		var hotness float64 // needed for ORDER BY; not part of the response
+		err := rows.Scan(&amp;p.ID, &amp;p.Title, &amp;p.Body, &amp;p.URL, &amp;p.Score, &amp;p.CreatedAt,
+			&amp;p.Author, &amp;p.Subreddit, &amp;p.CommentCount, &amp;hotness, &amp;total)
+		if err != nil {
+			return nil, Meta{}, err
+		}
+		posts = append(posts, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, Meta{}, err
+	}
+
+	meta := Meta{
+		Page:       f.Page,
+		PageSize:   f.PageSize,
+		Total:      total,
+		TotalPages: (total + int64(f.PageSize) - 1) / int64(f.PageSize),
+	}
+	return posts, meta, nil
+}</code></pre>
+</div>
+
+<p>Three details deserve a slow read:</p>
+<ul>
+  <li><strong><code>COUNT(*) OVER()</code></strong> — a <em>window function</em>: it stamps the
+      total number of matching rows onto every returned row, so we get data + total in one query
+      instead of a separate <code>SELECT COUNT(*)</code>.</li>
+  <li><strong><code>WHERE (? = 0 OR p.subreddit_id = ?)</code></strong> — one query serves both the
+      site-wide front page (filter 0 = off) and a single community's feed. </li>
+  <li><strong>The ORDER BY comes from a map</strong> — <span class="hl p">never, ever concatenate
+      user input into SQL</span>. The user's <code>?sort=</code> string only <em>chooses among our
+      three hard-coded ORDER BY strings</em>; every actual value in the query travels as a
+      <code>?</code> placeholder. That discipline is what makes SQL injection impossible here.</li>
+</ul>
+
+<div class="box deep">
+  <span class="box-title">The “hot” formula, on one napkin 🔥</span>
+  <p style="font-family:var(--mono);font-size:15px;text-align:center;margin:10px 0">
+  hotness = score ÷ (hours_old + 2)<sup>1.5</sup></p>
+  <p>“New” shows fresh-but-unproven posts; “top” shows proven-but-possibly-ancient ones. “Hot”
+  wants both: <b>score</b> in the numerator rewards upvotes, <b>age</b> in the denominator drags
+  every post down as it gets old — and the exponent 1.5 makes gravity accelerate: a day-old post
+  needs ~180× the score of a 1-hour-old post to tie. The <b>+2</b> stops a minutes-old post from
+  dividing by nearly zero and catapulting to #1 with a single vote.</p>
+  <p>In SQL, <code>julianday('now') - julianday(created_at)</code> gives the age in days (ride
+  those RFC-3339 strings again!), × 24 for hours, then <code>pow(…, 1.5)</code>. Real Reddit's
+  algorithm is logarithmic and more elaborate — but this is the honest little sibling of the same
+  idea, and it <em>feels</em> right in practice.</p>
+</div>
+
+<h2><span class="swipe green">Handlers: create, get, list — twice</span></h2>
+
+<p>Query-string parsing gets its own helper in <code>helpers.go</code> (defaults: hot, page 1,
+20 per page, max 100):</p>
+
+<div class="code-card"><span class="filename">cmd/api/helpers.go — add</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/helpers.go#func readPostFilters">// readPostFilters parses ?sort=&amp;page=&amp;page_size= with sane defaults.
+func (app *application) readPostFilters(r *http.Request) (store.PostFilters, error) {
+	q := r.URL.Query()
+	f := store.PostFilters{Sort: "hot", Page: 1, PageSize: 20}
+
+	if s := q.Get("sort"); s != "" {
+		if s != "new" &amp;&amp; s != "top" &amp;&amp; s != "hot" {
+			return f, errors.New("sort must be one of: new, top, hot")
+		}
+		f.Sort = s
+	}
+	if pg := q.Get("page"); pg != "" {
+		n, err := strconv.Atoi(pg)
+		if err != nil || n &lt; 1 {
+			return f, errors.New("page must be a positive whole number")
+		}
+		f.Page = n
+	}
+	if ps := q.Get("page_size"); ps != "" {
+		n, err := strconv.Atoi(ps)
+		if err != nil || n &lt; 1 || n &gt; 100 {
+			return f, errors.New("page_size must be between 1 and 100")
+		}
+		f.PageSize = n
+	}
+	return f, nil
+}</code></pre>
+</div>
+
+<div class="code-card"><span class="filename new">cmd/api/posts.go</span>
+<pre><code class="lang-go" data-src="gopherit:cmd/api/posts.go">package main
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+
+	"gopherit/internal/store"
+)
+
+// createPostHandler — POST /api/v1/posts  (auth required)
+// Body: {"subreddit": "golang", "title": "...", "body": "..."} for a text
+// post, or {"subreddit": "...", "title": "...", "url": "https://..."} for
+// a link post.
+func (app *application) createPostHandler(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Subreddit string `json:"subreddit"`
+		Title     string `json:"title"`
+		Body      string `json:"body"`
+		URL       string `json:"url"`
+	}
+	if err := app.readJSON(w, r, &amp;input); err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	input.Title = strings.TrimSpace(input.Title)
+	input.URL = strings.TrimSpace(input.URL)
+
+	p := make(problems)
+	p.check(input.Subreddit != "", "subreddit", "must be provided")
+	p.check(input.Title != "", "title", "must be provided")
+	p.check(len(input.Title) &lt;= 300, "title", "must be at most 300 characters")
+	p.check(len(input.Body) &lt;= 40_000, "body", "must be at most 40,000 characters")
+	p.check(input.Body == "" || input.URL == "", "url",
+		"a post can have a body or a url, not both")
+	if input.URL != "" {
+		p.check(strings.HasPrefix(input.URL, "http://") || strings.HasPrefix(input.URL, "https://"),
+			"url", "must start with http:// or https://")
+	}
+	if len(p) &gt; 0 {
+		app.failedValidation(w, p)
+		return
+	}
+
+	subreddit, err := app.store.SubredditByName(input.Subreddit)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.failedValidation(w, problems{"subreddit": "no such subreddit"})
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	user := app.currentUser(r)
+	post, err := app.store.CreatePost(subreddit.ID, user.ID, input.Title, input.Body, input.URL)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.writeJSON(w, http.StatusCreated, envelope{"post": post})
+}
+
+// getPostHandler — GET /api/v1/posts/{id}
+// Returns the post AND its full comment tree in one response.
+func (app *application) getPostHandler(w http.ResponseWriter, r *http.Request) {
+	id, err := app.readIDParam(r)
+	if err != nil {
+		app.notFound(w)
+		return
+	}
+
+	post, err := app.store.PostByID(id)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.notFound(w)
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	comments, err := app.store.CommentsForPost(id)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.writeJSON(w, http.StatusOK, envelope{"post": post, "comments": comments})
+}
+
+// listPostsHandler — GET /api/v1/posts?sort=hot&amp;page=1&amp;page_size=20
+// The site-wide front page.
+func (app *application) listPostsHandler(w http.ResponseWriter, r *http.Request) {
+	filters, err := app.readPostFilters(r)
+	if err != nil {
+		app.badRequest(w, err)
+		return
+	}
+
+	posts, meta, err := app.store.ListPosts(filters)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.writeJSON(w, http.StatusOK, envelope{"posts": posts, "meta": meta})
+}
+
+// listSubredditPostsHandler — GET /api/v1/subreddits/{name}/posts
+// Same as the front page, but scoped to one community.
+func (app *application) listSubredditPostsHandler(w http.ResponseWriter, r *http.Request) {
+	subreddit, err := app.store.SubredditByName(r.PathValue("name"))
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			app.notFound(w)
+		default:
+			app.serverError(w, r, err)
+		}
+		return
+	}
+
+	filters, err := app.readPostFilters(r)
+	if err != nil {
+		app.badRequest(w, err)
+		return
+	}
+	filters.SubredditID = subreddit.ID
+
+	posts, meta, err := app.store.ListPosts(filters)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.writeJSON(w, http.StatusOK, envelope{"posts": posts, "meta": meta})
+}</code></pre>
+</div>
+
+<p>Note the validation twist in <code>createPostHandler</code>: “no such subreddit” is reported as
+a <em>422 on the subreddit field</em>, exactly like a too-long title — from the client's
+perspective, both are “fix your input”, not “resource missing”.</p>
+
+<h2><span class="swipe blue">Feed it and watch it rank</span></h2>
+
+<div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
+<pre><code class="lang-bash"># linus shares a link post:
+$ curl -s -X POST localhost:4000/api/v1/posts -H "Authorization: Bearer $TOKEN" \
+    -d '{"subreddit":"golang","title":"Go 1.24 released!","url":"https://go.dev/blog/go1.24"}'
+{
+	"post": {
+		"id": 1,
+		"title": "Go 1.24 released!",
+		"url": "https://go.dev/blog/go1.24",
+		"score": 0,
+		"comment_count": 0,
+		"author": "linus",
+		"subreddit": "golang",
+		"created_at": "2026-07-07T15:45:08Z"
+	}
+}
+
+# body AND url? rejected:
+$ curl -s -X POST localhost:4000/api/v1/posts -H "Authorization: Bearer $TOKEN" \
+    -d '{"subreddit":"golang","title":"both","body":"text","url":"https://x.com"}'
+{
+	"error": {
+		"url": "a post can have a body or a url, not both"
+	}
+}
+
+# the front page, sorted by top, two per page — with the receipt:
+$ curl -s "localhost:4000/api/v1/posts?sort=top&page_size=2"
+{
+	"meta": {
+		"page": 1,
+		"page_size": 2,
+		"total": 2,
+		"total_pages": 1
+	},
+	"posts": [
+		{
+			"id": 2,
+			"title": "I just built my first REST API in Go!",
+			"body": "Following the handwritten notes ebook. AMA.",
+			"score": 2,
+			"comment_count": 0,
+			"author": "ada",
+			"subreddit": "golang",
+			"created_at": "2026-07-07T15:45:08Z"
+		},
+		{
+			"id": 1,
+			"title": "Go 1.24 released!",
+			"url": "https://go.dev/blog/go1.24",
+			"score": 1,
+			"comment_count": 0,
+			"author": "linus",
+			"subreddit": "golang",
+			"created_at": "2026-07-07T15:45:08Z"
+		}
+	]
+}
+
+# page 2 with page_size=1 — meta tells the client there IS a page 2 of 2:
+$ curl -s "localhost:4000/api/v1/posts?page=2&page_size=1&sort=new"
+{
+	"meta": {
+		"page": 2,
+		"page_size": 1,
+		"total": 2,
+		"total_pages": 2
+	},
+	"posts": [
+		{
+			"id": 1,
+			"title": "Go 1.24 released!",
+			"url": "https://go.dev/blog/go1.24",
+			"score": 1,
+			"comment_count": 0,
+			"author": "linus",
+			"subreddit": "golang",
+			"created_at": "2026-07-07T15:45:08Z"
+		}
+	]
+}</code></pre>
+</div>
+
+<span class="scribble v">text post shows "body", link post shows "url" — omitempty keeping the JSON tidy ✂️</span>
+
+<div class="recap">
+<h2><span class="swipe">Pin to your brain 📌</span></h2>
+<ul class="checklist">
+  <li>Variant data (text/link) can share a table; enforce the either/or in validation.</li>
+  <li>JOIN names into responses — don't make clients do id lookups.</li>
+  <li>Pagination = LIMIT/OFFSET + a meta receipt (<code>COUNT(*) OVER()</code> gets both at once).</li>
+  <li>User input may <em>choose between</em> hard-coded SQL strings; it must never <em>become</em> SQL.</li>
+  <li>hot = score ÷ (hours+2)<sup>1.5</sup> — upvotes lift, gravity pulls, +2 protects newborns.</li>
+</ul>
+<p><b>Next up:</b> the part everyone actually comes to Reddit for — the comment section. Trees,
+pointers, and votes with database-enforced honesty.</p>
+</div>
+
+<nav class="booknav bottom">
+  <a href="ch09.html">← Ch 9 · Subreddits</a>
+  <span class="spacer"></span>
+  <a class="toc-link" href="index.html">☰ contents</a>
+  <span class="spacer"></span>
+  <a href="ch11.html">Ch 11 · Comments &amp; Votes →</a>
+</nav>
+
+</div>
+</body>
+</html>
