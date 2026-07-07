@@ -22,7 +22,10 @@ jobs:
         go-version: '1.22'
 
     - name: Build
-      run: go build -v ./...
+      run: go build -v ./... && (cd app && go build -v ./...)
+
+    - name: Vet
+      run: go vet ./... && (cd app && go vet ./...)
 
     - name: Test
-      run: go test -v ./...
+      run: go test -v ./... && (cd app && go test -v ./...)

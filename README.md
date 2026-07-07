@@ -236,6 +236,42 @@ keys are read from the server's environment only — they never cross the MCP wi
 `ARCHI_TIMEOUT` caps every tool call, streaming included. stdout carries protocol JSON only;
 progress and logging go to stderr.
 
+## GitHub App
+
+`archi-app` (its own zero-dep module under [`app/`](app/)) brings archi to teams: a webhook
+service that runs the CLI in per-job workspace clones and posts results back to GitHub.
+Comment on an issue or PR (write access required; the 👀 reaction is the ack):
+
+| Comment | Result |
+|---|---|
+| `/archi design <request>` | the design, posted as a comment |
+| `/archi design --pr <request>` | a **draft PR** with `docs/designs/<slug>.md` on an `archi/design-*` branch |
+| `/archi build` | on that design PR: generated code pushed to the same branch |
+| `/archi review` | a PR review from the critic panel + an "archi review" check run |
+
+With `auto_review: true` in `.github/archi.yml`, every PR open/synchronize gets a review check
+run automatically (fork PRs are reviewed from the API diff — fork code is never checked out, and
+`/archi build` never runs on forks). Per-repo config is a flat `key: value` file:
+
+```yaml
+# .github/archi.yml
+provider: anthropic       # ollama | anthropic | openai
+model: claude-fable-5
+critic_model: claude-haiku-4-5
+agents: full              # full | fast
+auto_review: true
+max_tokens: 12000
+```
+
+Deploy `archi-app serve` (Dockerfile included — needs `git`, the `archi` binary, and a volume
+for the `.archi` cache at `CACHE_DIR`). Required env: `APP_ID`, `WEBHOOK_SECRET`, and
+`PRIVATE_KEY_PATH` or `PRIVATE_KEY_BASE64`; provider API keys are forwarded only to CLI child
+processes. Tunables: `ARCHI_BIN`, `CACHE_DIR`, `WORK_DIR`, `WORKERS`, `QUEUE_SIZE`,
+`MAX_JOBS_PER_HOUR`, `JOB_TIMEOUT` (also exported to the CLI as `ARCHI_TIMEOUT`). The GitHub App
+needs `contents: write`, `issues: write`, `pull_requests: write`, `checks: write`,
+`metadata: read`, and the `issue_comment`, `pull_request`, `issues`, `installation` events, with
+the webhook pointed at `https://<your-host>/webhook`.
+
 ## Sample output
 
 `archi design` emits Markdown so the structure survives the paste, with Mermaid

@@ -19,7 +19,8 @@ before:
     - go mod tidy
 
 builds:
-  - main: .
+  - id: archi
+    main: .
     binary: archi
     env:
       - CGO_ENABLED=0
@@ -38,13 +39,48 @@ builds:
       - -s -w -X main.version={{ .Version }}
     mod_timestamp: "{{ .CommitTimestamp }}"
 
+  # The GitHub App service (app/ is its own zero-dep module).
+  - id: archi-app
+    dir: app
+    main: .
+    binary: archi-app
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
 archives:
-  - formats: [tar.gz]
+  - id: archi
+    ids: [archi]
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+  - id: archi-app
+    ids: [archi-app]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      archi-app_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
       - README.md
       - LICENSE
