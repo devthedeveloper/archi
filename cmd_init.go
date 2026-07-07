@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -52,8 +53,7 @@ func cmdInit(args []string) {
 		}
 	}
 
-	prov, err := newProvider(*provider, *model, 0.3, 4000)
-	if err != nil {
+	if _, err := newProvider(*provider, *model, 0.3, 4000); err != nil {
 		failf("%v", err)
 	}
 
@@ -62,54 +62,118 @@ func cmdInit(args []string) {
 
 	banner()
 
+	if _, err := initCore(ctx, initOptions{
+		Root: root, Provider: *provider, Model: *model,
+		Force: *force, Refresh: *refresh,
+		MaxFileBytes: *maxFileKB * 1024,
+	}); err != nil {
+		failf("%v", err)
+	}
+}
+
+// initOptions parameterizes one init/refresh run. Progress, when non-nil,
+// receives coarse milestones (for MCP progress notifications); mk overrides
+// the provider factory in tests — nil means newProvider.
+type initOptions struct {
+	Root, Provider, Model string
+	Force, Refresh        bool
+	MaxFileBytes          int64
+	Progress              func(message string, frac float64) // nil OK
+	mk                    func(name, model string, temp float64, maxTokens int) (Provider, error)
+}
+
+// step reports a progress milestone when a callback is registered.
+func (o initOptions) step(frac float64, message string) {
+	if o.Progress != nil {
+		o.Progress(message, frac)
+	}
+}
+
+// initReport summarizes what initCore did, for the caller's rendering.
+// Refreshed means an incremental refresh was applied; Fresh means the cache
+// already matched the repo; Drift holds the drift summary when one was
+// measured (also set when a refresh fell back to a full rebuild).
+type initReport struct {
+	Files, Tokens    int
+	Refreshed, Fresh bool
+	Drift            string
+}
+
+// initCore is the body of `archi init` after flag validation: scan, map,
+// profile, fingerprint, config. It never calls failf or prompts — errors are
+// returned for the caller (CLI wrapper or MCP handler) to translate. Stderr
+// chrome (ok/info/spinners) is unchanged from the CLI.
+func initCore(ctx context.Context, o initOptions) (*initReport, error) {
+	mk := o.mk
+	if mk == nil {
+		mk = newProvider
+	}
+	prov, err := mk(o.Provider, o.Model, 0.3, 4000)
+	if err != nil {
+		return nil, err
+	}
+	root := o.Root
+	rep := &initReport{}
+
 	// 1. Scan.
 	files, err := scanRepo(root)
 	if err != nil {
-		failf("scan failed: %v", err)
+		return nil, fmt.Errorf("scan failed: %v", err)
 	}
 	if len(files) == 0 {
-		failf("no files found under %s", root)
+		return nil, fmt.Errorf("no files found under %s", root)
 	}
 	stats, totalFiles, totalTokens := languageStats(files)
+	rep.Files, rep.Tokens = totalFiles, totalTokens
 	ok("Scanned " + humanCount(totalFiles) + " files · ~" + humanCount(totalTokens) + " tokens")
 	langBars(stats, totalTokens, true)
+	o.step(0.2, "Scanned the repository")
 
 	// Incremental refresh: update just what drifted. When the cache can't be
 	// refreshed (no fingerprint, or too much changed) fall through to a full
 	// rebuild.
-	if *refresh && refreshCache(ctx, prov, *provider, root, files, stats, totalFiles, totalTokens, *maxFileKB*1024) {
-		return
+	if o.Refresh {
+		done, err := refreshCache(ctx, prov, o, files, stats, totalFiles, totalTokens, rep)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			rep.Refreshed = !rep.Fresh
+			return rep, nil
+		}
 	}
 
 	// 2. Write the deterministic map.
 	if err := os.MkdirAll(archiDir(root), 0o755); err != nil {
-		failf("%v", err)
+		return nil, err
 	}
 	mapMD := buildMap(root, files)
 	if err := os.WriteFile(mapPath(root), []byte(mapMD), 0o644); err != nil {
-		failf("%v", err)
+		return nil, err
 	}
 	ok("Mapped repo → " + mapPath(root))
+	o.step(0.4, "Understanding your codebase")
 
 	// 3. Select the profile seed and ask the model to understand the repo.
-	seed, seedTokens := selectSeed(root, files, 40000, *maxFileKB*1024)
+	seed, seedTokens := selectSeed(root, files, 40000, o.MaxFileBytes)
 	info("Reading " + humanCount(len(seed)) + " key files (~" + humanCount(seedTokens) + " tokens) with " + prov.Name())
 
 	sp := startSpinner("Understanding your codebase")
 	profile, err := runModel(ctx, prov, analystPrompt, analystUserMessage(mapMD, seed), nil, sp)
 	if err != nil {
 		sp.Abort()
-		failf("%v", err)
+		return nil, err
 	}
 	sp.Stop("Understood → " + profilePath(root))
 	if err := os.WriteFile(profilePath(root), []byte(profile), 0o644); err != nil {
-		failf("%v", err)
+		return nil, err
 	}
+	o.step(0.8, "Profile written")
 
 	// 4. Fingerprint the repo so design/status can detect drift and -refresh
 	// can update incrementally.
 	if err := writeFingerprint(root, buildFingerprint(root, files)); err != nil {
-		failf("%v", err)
+		return nil, err
 	}
 
 	// 5. Persist config and tidy .gitignore.
@@ -119,7 +183,7 @@ func cmdInit(args []string) {
 	}
 	cfg := &Config{
 		Version:       version,
-		Provider:      *provider,
+		Provider:      o.Provider,
 		Model:         prov.Model(),
 		Root:          root,
 		InitializedAt: time.Now().UTC().Format(time.RFC3339),
@@ -128,13 +192,15 @@ func cmdInit(args []string) {
 		ApproxTokens:  totalTokens,
 	}
 	if err := cfg.save(root); err != nil {
-		failf("%v", err)
+		return nil, err
 	}
 	ensureGitignored(root)
+	o.step(1.0, "Cache ready")
 
 	os.Stderr.WriteString("\n")
 	ok(bold("Ready.") + "  Now run  " + cyan(`archi design "add …"`))
 	os.Stderr.WriteString("\n")
+	return rep, nil
 }
 
 // refreshSeedBudget bounds the changed-file sample sent on a refresh — a
@@ -144,75 +210,83 @@ const refreshSeedBudget = 20000
 // refreshCache updates .archi incrementally: it diffs the stored fingerprint
 // against the repo, regenerates the map deterministically, and asks the model
 // to revise the existing profile from only the added and modified files. It
-// returns false when the cache can't be refreshed — no fingerprint, no
+// returns (false, nil) when the cache can't be refreshed — no fingerprint, no
 // profile, or drift past 40% of the fingerprinted files — so the caller falls
-// back to a full rebuild.
-func refreshCache(ctx context.Context, prov Provider, providerName, root string, files []fileInfo, stats []langStat, totalFiles, totalTokens int, maxFileBytes int64) bool {
+// back to a full rebuild. Outcome details (fresh cache, drift summary) land
+// in rep.
+func refreshCache(ctx context.Context, prov Provider, o initOptions, files []fileInfo, stats []langStat, totalFiles, totalTokens int, rep *initReport) (done bool, err error) {
+	root := o.Root
 	old, err := loadFingerprint(root)
 	if err != nil {
 		info("No fingerprint from the last init — doing a full rebuild")
-		return false
+		return false, nil
 	}
 	profileMD, err := os.ReadFile(profilePath(root))
 	if err != nil {
 		info("No cached profile — doing a full rebuild")
-		return false
+		return false, nil
 	}
 	cur := buildFingerprint(root, files)
 	d := diffFingerprints(old, cur)
 	if d.empty() {
 		ok("Cache is fresh — nothing to refresh")
-		return true
+		rep.Fresh = true
+		o.step(1.0, "Cache is fresh")
+		return true, nil
 	}
+	rep.Drift = d.summary()
 	if needsFullRebuild(d, len(old)) {
 		info("Repo drifted too far (" + d.summary() + ") — doing a full rebuild")
-		return false
+		return false, nil
 	}
 
 	// The map is deterministic; regenerate it whole, no model needed.
 	mapMD := buildMap(root, files)
 	if err := os.WriteFile(mapPath(root), []byte(mapMD), 0o644); err != nil {
-		failf("%v", err)
+		return false, err
 	}
 	ok("Remapped repo → " + mapPath(root))
+	o.step(0.3, "Remapped the repository")
 
 	// Sample only the added and modified files (same selection and redaction
 	// as init) and ask the model to revise the existing profile.
-	seed, seedTokens := selectSeed(root, changedFiles(files, d), refreshSeedBudget, maxFileBytes)
+	seed, seedTokens := selectSeed(root, changedFiles(files, d), refreshSeedBudget, o.MaxFileBytes)
 	info("Refreshing from " + d.summary() + " (~" + humanCount(seedTokens) + " tokens) with " + prov.Name())
 
 	sp := startSpinner("Updating the codebase profile")
 	profile, err := runModel(ctx, prov, refreshPrompt, refreshUserMessage(string(profileMD), mapMD, d.summary(), seed, d.removed), nil, sp)
 	if err != nil {
 		sp.Abort()
-		failf("%v", err)
+		return false, err
 	}
 	sp.Stop("Updated → " + profilePath(root))
 	if err := os.WriteFile(profilePath(root), []byte(profile), 0o644); err != nil {
-		failf("%v", err)
+		return false, err
 	}
+	o.step(0.7, "Profile updated")
 	if err := writeFingerprint(root, cur); err != nil {
-		failf("%v", err)
+		return false, err
 	}
 
 	cfg, err := loadConfig(root)
 	if err != nil {
-		failf("%v", err)
+		return false, err
 	}
 	langMap := map[string]int{}
 	for _, s := range stats {
 		langMap[s.name] = s.tokens
 	}
-	cfg.Provider, cfg.Model = providerName, prov.Model()
+	cfg.Provider, cfg.Model = o.Provider, prov.Model()
 	cfg.Languages, cfg.FileCount, cfg.ApproxTokens = langMap, totalFiles, totalTokens
 	if err := cfg.save(root); err != nil {
-		failf("%v", err)
+		return false, err
 	}
+	o.step(1.0, "Cache refreshed")
 
 	os.Stderr.WriteString("\n")
 	ok(bold("Refreshed.") + "  The cache matches the repo again.")
 	os.Stderr.WriteString("\n")
-	return true
+	return true, nil
 }
 
 // selectSeed picks a token-bounded, priority-ordered subset of files for the

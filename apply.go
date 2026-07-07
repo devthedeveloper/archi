@@ -32,11 +32,98 @@ func safeRel(p string) (string, bool) {
 	return clean, true
 }
 
+// changePreview is one proposed change, render-ready.
+type changePreview struct {
+	Path  string
+	Kind  string // "create" | "overwrite" | "delete"
+	Lines int
+	Diff  string // unifiedDiff output; "" for create/delete
+}
+
+// previewChanges validates paths via safeRel (unsafe ones dropped, reported
+// in skipped) and computes diffs against on-disk content. Read-only: it
+// writes nothing and prints nothing. previews aligns with valid.
+func previewChanges(root string, changes []fileChange) (valid []fileChange, previews []changePreview, skipped []string) {
+	for _, c := range changes {
+		rel, okPath := safeRel(c.path)
+		if !okPath {
+			skipped = append(skipped, c.path)
+			continue
+		}
+		c.path = rel
+		valid = append(valid, c)
+		p := changePreview{Path: rel}
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		old, readErr := os.ReadFile(full)
+		exists := readErr == nil
+		switch {
+		case c.del:
+			p.Kind = "delete"
+		case exists:
+			p.Kind = "overwrite"
+			p.Lines = strings.Count(c.content, "\n") + 1
+			p.Diff = unifiedDiff(string(old), ensureTrailingNewline(c.content), rel)
+		default:
+			p.Kind = "create"
+			p.Lines = strings.Count(c.content, "\n") + 1
+		}
+		previews = append(previews, p)
+	}
+	return valid, previews, skipped
+}
+
+// writeChanges backs up and writes valid changes with no prompting. backupDir
+// is "" when no originals were backed up (a creates-only run still records a
+// manifest for rollback, but has nothing to back up).
+func writeChanges(root string, valid []fileChange, now time.Time) (written int, backupDir string, err error) {
+	written, run, err := writeChangesRun(root, valid, now)
+	if err != nil {
+		return written, "", err
+	}
+	if len(run.files) > 0 {
+		backupDir = run.dir
+	}
+	return written, backupDir, nil
+}
+
+// writeChangesRun is writeChanges returning the full backup run, which
+// applyChanges needs for its stamp and message.
+func writeChangesRun(root string, valid []fileChange, now time.Time) (int, *backupRun, error) {
+	run := newBackupRun(root, now)
+	written := 0
+	for _, c := range valid {
+		full := filepath.Join(root, filepath.FromSlash(c.path))
+		if c.del {
+			run.save(c.path)
+			if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+				return written, run, err
+			}
+			written++
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return written, run, err
+		}
+		if _, statErr := os.Stat(full); statErr == nil {
+			run.save(c.path)
+		} else {
+			run.markCreated(c.path)
+		}
+		if err := os.WriteFile(full, []byte(ensureTrailingNewline(c.content)), 0o644); err != nil {
+			return written, run, err
+		}
+		written++
+	}
+	run.finish()
+	return written, run, nil
+}
+
 // applyChanges previews the generated file changes — including a unified diff
 // for every overwrite — asks for confirmation (unless autoYes), copies each
 // file it overwrites or deletes into a timestamped run directory under
 // .archi/backups/, and writes them. Paths that escape the repo root are
-// refused.
+// refused. It composes previewChanges and writeChangesRun with the original
+// interactive chrome in between.
 func applyChanges(root string, changes []fileChange, autoYes bool) (applied bool, stamp string, err error) {
 	if len(changes) == 0 {
 		warn("The model returned no file changes.")
@@ -45,26 +132,23 @@ func applyChanges(root string, changes []fileChange, autoYes bool) (applied bool
 
 	os.Stderr.WriteString("\n")
 	info(bold("Proposed changes:"))
-	valid := changes[:0:0]
+	valid, previews, _ := previewChanges(root, changes)
+	vi := 0
 	for _, c := range changes {
-		rel, okPath := safeRel(c.path)
-		if !okPath {
+		if _, okPath := safeRel(c.path); !okPath {
 			warn("refusing unsafe path: " + c.path)
 			continue
 		}
-		c.path = rel
-		valid = append(valid, c)
-		full := filepath.Join(root, filepath.FromSlash(rel))
-		old, readErr := os.ReadFile(full)
-		exists := readErr == nil
-		switch {
-		case c.del:
-			fmt.Fprintln(os.Stderr, "    "+red("delete")+"    "+rel)
-		case exists:
-			fmt.Fprintln(os.Stderr, "    "+yellow("overwrite")+" "+rel+dim(fmt.Sprintf("  (%d lines)", strings.Count(c.content, "\n")+1)))
-			printDiff(unifiedDiff(string(old), ensureTrailingNewline(c.content), rel), maxDiffDisplayLines)
+		p := previews[vi]
+		vi++
+		switch p.Kind {
+		case "delete":
+			fmt.Fprintln(os.Stderr, "    "+red("delete")+"    "+p.Path)
+		case "overwrite":
+			fmt.Fprintln(os.Stderr, "    "+yellow("overwrite")+" "+p.Path+dim(fmt.Sprintf("  (%d lines)", p.Lines)))
+			printDiff(p.Diff, maxDiffDisplayLines)
 		default:
-			fmt.Fprintln(os.Stderr, "    "+green("create")+"    "+rel+dim(fmt.Sprintf("  (%d lines)", strings.Count(c.content, "\n")+1)))
+			fmt.Fprintln(os.Stderr, "    "+green("create")+"    "+p.Path+dim(fmt.Sprintf("  (%d lines)", p.Lines)))
 		}
 	}
 	if len(valid) == 0 {
@@ -79,32 +163,10 @@ func applyChanges(root string, changes []fileChange, autoYes bool) (applied bool
 		return false, "", nil
 	}
 
-	run := newBackupRun(root, time.Now())
-	written := 0
-	for _, c := range valid {
-		full := filepath.Join(root, filepath.FromSlash(c.path))
-		if c.del {
-			run.save(c.path)
-			if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-				return false, "", err
-			}
-			written++
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return false, "", err
-		}
-		if _, statErr := os.Stat(full); statErr == nil {
-			run.save(c.path)
-		} else {
-			run.markCreated(c.path)
-		}
-		if err := os.WriteFile(full, []byte(ensureTrailingNewline(c.content)), 0o644); err != nil {
-			return false, "", err
-		}
-		written++
+	written, run, err := writeChangesRun(root, valid, time.Now())
+	if err != nil {
+		return false, "", err
 	}
-	run.finish()
 	if len(run.files)+len(run.created) > 0 {
 		stamp = filepath.Base(run.dir)
 	}
