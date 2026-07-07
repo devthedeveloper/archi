@@ -28,6 +28,93 @@ type diffFile struct {
 // maxReviewChunks caps how many diff chunks are reviewed.
 const maxReviewChunks = 8
 
+// Registering here lights up the archi_review MCP tool whenever this file is
+// in the build (cmd_serve.go omits the tool while the hook is nil).
+func init() { serveReviewCore = reviewCoreForServe }
+
+// reviewCoreForServe runs the critic-panel review non-interactively for the
+// archi_review MCP tool: resolve the diff (explicit patch, else git diff
+// HEAD), redact, chunk, run the panel, and render the review document.
+// blocking mirrors reviewExitCode — the caller treats a blocking verdict as
+// content, never as a tool error.
+func reviewCoreForServe(ctx context.Context, root, patch string) (doc string, blocking bool, err error) {
+	diff, source := patch, "patch"
+	if strings.TrimSpace(diff) == "" {
+		if diff, err = gitDiffHEAD(root); err != nil {
+			return "", false, errors.New("nothing to review — pass a unified diff in patch, or point path at a git repository")
+		}
+		source = "git diff HEAD"
+	}
+	if strings.TrimSpace(diff) == "" {
+		return "Working tree clean — nothing to review", false, nil
+	}
+	diff = redactForPrompt("(diff)", diff)
+
+	profile, groundingSkipped := "", ""
+	if isInitialized(root) {
+		if data, rerr := os.ReadFile(profilePath(root)); rerr == nil {
+			profile = string(data)
+		}
+	} else {
+		groundingSkipped = "no .archi cache"
+	}
+	pName, pModel := "ollama", ""
+	if cfg, cerr := loadConfig(root); cerr == nil {
+		pName, pModel = cfg.Provider, cfg.Model
+	}
+	criticMk := func(mt int) Provider { p, _ := newProvider(pName, pModel, 0, mt); return p }
+
+	chunkBudget := contextBudget() - estimateTokens(profile) - 2000
+	if chunkBudget < 1000 {
+		chunkBudget = 1000
+	}
+	chunks := packReviewChunks(splitDiffByFile(diff), chunkBudget)
+	specs := reviewSpecs()
+	if groundingSkipped != "" {
+		specs = specs[:2] // sec + simp; grounding needs the profile
+	}
+
+	orch := newOrchestrator(root)
+	merged := map[AgentRole]*Verdict{}
+	for _, chunk := range chunks {
+		var chunkText strings.Builder
+		for _, f := range chunk {
+			chunkText.WriteString(f.body)
+		}
+		calls := make([]AgentCall, len(specs))
+		for i, s := range specs {
+			calls[i] = AgentCall{
+				Agent: Agent{Spec: s, P: criticMk(s.MaxTokens)},
+				Input: TaskInput{Request: "review this diff", Extra: map[string]string{"user_message": reviewUserMessage(profile, chunkText.String())}},
+			}
+		}
+		for i, res := range orch.RunPool(ctx, calls) {
+			if res.Err != nil {
+				continue
+			}
+			v, _ := parseVerdict(res.Output)
+			if specs[i].Role == RoleGrndCritic {
+				downgradePathless(v)
+			}
+			merged[specs[i].Role] = mergeVerdicts(merged[specs[i].Role], v)
+		}
+	}
+
+	var results []reviewResult
+	for _, role := range criticRoles {
+		if role == RoleGrndCritic && groundingSkipped != "" {
+			results = append(results, reviewResult{Role: role, Skipped: groundingSkipped})
+			continue
+		}
+		results = append(results, reviewResult{Role: role, Verdict: merged[role]})
+	}
+	var vs []*Verdict
+	for _, r := range results {
+		vs = append(vs, r.Verdict)
+	}
+	return renderReviewDoc(source, results), reviewExitCode(vs) == 1, nil
+}
+
 func cmdReview(args []string) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	patch := fs.String("patch", "", "review this patch file")

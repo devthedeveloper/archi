@@ -11,7 +11,7 @@ import (
 
 // version is the release version; goreleaser overrides it at build time via
 // -ldflags "-X main.version=...".
-var version = "1.6.0"
+var version = "1.7.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -35,6 +35,8 @@ func main() {
 		cmdDoc(os.Args[2:])
 	case "memory":
 		cmdMemory(os.Args[2:])
+	case "serve":
+		cmdServe(os.Args[2:])
 	case "version", "-version", "--version", "-v":
 		fmt.Println("archi", version)
 	case "help", "-h", "--help":
@@ -61,6 +63,7 @@ func printHelp() {
     `+cyan("doc")+`                  Sync README/docs with what was designed & built
     `+cyan("memory")+`               Show, edit, or compact archi's decision memory
     `+cyan("rollback")+`             Restore the files a build run overwrote or created
+    `+cyan("serve")+`                Run as an MCP server over stdio (for agent clients)
     `+cyan("version")+`              Print the version
 
   `+bold("QUICK START")+`

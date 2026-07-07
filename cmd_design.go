@@ -47,13 +47,11 @@ func cmdDesign(args []string) {
 	fs.Parse(args)
 
 	root := "."
-	if !isInitialized(root) {
-		failf("no .archi cache here — run %s first", cyan("archi init"))
-	}
-	cfg, err := loadConfig(root)
+	g, err := loadGrounding(root, focus)
 	if err != nil {
-		failf("reading .archi: %v", err)
+		failf("%v", err)
 	}
+	cfg := g.cfg
 
 	var fileData []byte
 	if *file != "" {
@@ -107,35 +105,12 @@ func cmdDesign(args []string) {
 		return p
 	}
 
-	mapMD, err := os.ReadFile(mapPath(root))
-	if err != nil {
-		failf("reading map: %v (try %s)", err, cyan("archi init -force"))
-	}
-	profileMD, err := os.ReadFile(profilePath(root))
-	if err != nil {
-		failf("reading profile: %v (try %s)", err, cyan("archi init -force"))
-	}
-	var focusFiles []seedFile
-	if len(focus) > 0 {
-		focusFiles = collectFocus(root, focus)
-	}
-
-	// Staleness is advisory: warn when the repo drifted from the cache, but
-	// design anyway — an approximate profile still beats none.
-	if d, fresh := checkFreshness(root); fresh && !d.empty() {
-		warn("repo has changed since init: " + d.summary() + " — consider " + cyan("archi init -refresh"))
-	}
-
-	// Fit the grounding into the context budget: the profile always ships
-	// whole; the map and focus files shrink or drop to fit.
-	profile, fileMap, fitFocus := fitGrounding(string(profileMD), string(mapMD), focusFiles)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	sess := &session{
 		ctx: ctx, mk: mk, root: root, cfg: cfg,
-		profile: profile, fileMap: fileMap, focus: fitFocus,
+		profile: g.profile, fileMap: g.fileMap, focus: g.focus,
 		maxTokens: *maxTokens, yes: *yes, htmlFile: *htmlFile,
 		opts: opts, criticMk: criticMk,
 		swarm:     *swarm == "on" || (*swarm == "" && opts.mode == "full"),
@@ -152,6 +127,50 @@ func cmdDesign(args []string) {
 		return
 	}
 	sess.runOneShot(request, *out, *build, *noStream)
+}
+
+// grounding is everything a design or build call needs from the .archi cache,
+// already fitted to the context budget.
+type grounding struct {
+	cfg              *Config
+	profile, fileMap string
+	focus            []seedFile
+}
+
+// loadGrounding loads config, profile, map, and focus files for root, warns
+// (stderr) on staleness, and fits the context budget. It returns errors —
+// never failf — so both cmdDesign and the MCP server can use it.
+func loadGrounding(root string, focusGlobs []string) (*grounding, error) {
+	if !isInitialized(root) {
+		return nil, fmt.Errorf("no .archi cache here — run %s first", cyan("archi init"))
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return nil, fmt.Errorf("reading .archi: %v", err)
+	}
+	mapMD, err := os.ReadFile(mapPath(root))
+	if err != nil {
+		return nil, fmt.Errorf("reading map: %v (try %s)", err, cyan("archi init -force"))
+	}
+	profileMD, err := os.ReadFile(profilePath(root))
+	if err != nil {
+		return nil, fmt.Errorf("reading profile: %v (try %s)", err, cyan("archi init -force"))
+	}
+	var focusFiles []seedFile
+	if len(focusGlobs) > 0 {
+		focusFiles = collectFocus(root, focusGlobs)
+	}
+
+	// Staleness is advisory: warn when the repo drifted from the cache, but
+	// design anyway — an approximate profile still beats none.
+	if d, fresh := checkFreshness(root); fresh && !d.empty() {
+		warn("repo has changed since init: " + d.summary() + " — consider " + cyan("archi init -refresh"))
+	}
+
+	// Fit the grounding into the context budget: the profile always ships
+	// whole; the map and focus files shrink or drop to fit.
+	profile, fileMap, fitFocus := fitGrounding(string(profileMD), string(mapMD), focusFiles)
+	return &grounding{cfg: cfg, profile: profile, fileMap: fileMap, focus: fitFocus}, nil
 }
 
 // session carries everything the design lifecycle needs between phases.
@@ -378,6 +397,29 @@ func (s *session) runOneShot(request, outPath string, build, noStream bool) {
 		s.buildCode(doc)
 	}
 	s.printCost()
+}
+
+// designDoc runs one non-interactive design generation — the ensemble in
+// full mode, a single architectPrompt call otherwise (runOneShot's non-live
+// branch) — records history, and returns the document. No stdout writes and
+// no failf: this is the path the MCP server calls.
+func (s *session) designDoc(request string) (string, error) {
+	var doc string
+	if s.opts.mode == "full" {
+		var err error
+		if doc, err = s.designEnsemble(request, "", nil); err != nil {
+			return "", err
+		}
+	} else {
+		res := s.orch.runStream(s.ctx, s.agentFor(RoleDesigner, ""),
+			designTask(request, designUserMessage(s.profile, s.fileMap, "", s.memory, s.focus, request)), nil, nil)
+		if res.Err != nil {
+			return "", res.Err
+		}
+		doc = res.Output
+	}
+	s.recordDesign(request, s.design().Name(), doc)
+	return doc, nil
 }
 
 // recordDesign saves (or refreshes) the design in .archi/designs. History is

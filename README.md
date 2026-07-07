@@ -112,6 +112,7 @@ export ARCHI_TIMEOUT=10m   # any Go duration string, e.g. 90s, 10m
 archi init [path]              # learn a codebase (default: current dir)
 archi design [flags] <request> # design a change against it
 archi status                   # what archi has learned here
+archi serve [-root <path>]     # expose archi as MCP tools for agent clients
 ```
 
 ### `archi init`
@@ -196,6 +197,44 @@ most recent backup runs are kept. Paths that would escape the repo are refused.
 Each design is also saved to `.archi/designs/<timestamp>-<slug>.md` with a small
 header (request, provider, date, and whether it was built) — `archi status` shows
 the last five.
+
+## MCP
+
+`archi serve` runs archi as a [Model Context Protocol](https://modelcontextprotocol.io) server
+over stdio, so agent clients — Claude Code, Claude Desktop/Cowork, Cursor — can call it as
+tools: `archi_status`, `archi_init`, `archi_design`, `archi_build`, `archi_review`, and
+`archi_rollback`. Every tool call is confined to the `-root` directory (default: the working
+directory at launch). `archi_build` is a dry run unless `dry_run:false` is passed, and real
+writes are refused while the repo has uncommitted changes unless `allow_dirty:true` — stricter
+than the CLI, since there is no human at a confirm prompt.
+
+Claude Code:
+
+```sh
+claude mcp add archi -- archi serve -root "$(pwd)"
+# provider keys come from your shell env, e.g. export ANTHROPIC_API_KEY=…
+```
+
+Claude Desktop / Cowork (`claude_desktop_config.json`):
+
+```json
+{"mcpServers": {"archi": {
+  "command": "archi",
+  "args": ["serve", "-root", "/abs/path/to/repo"],
+  "env": {"OLLAMA_API_KEY": "…", "ARCHI_TIMEOUT": "10m"}}}}
+```
+
+Generic project-scoped `.mcp.json` (Claude Code, Cursor):
+
+```json
+{"mcpServers": {"archi": {"command": "archi", "args": ["serve"],
+  "env": {"ARCHI_TIMEOUT": "10m"}}}}
+```
+
+No `-root` means the working directory, which project-scoped clients set to the repo. Provider
+keys are read from the server's environment only — they never cross the MCP wire — and
+`ARCHI_TIMEOUT` caps every tool call, streaming included. stdout carries protocol JSON only;
+progress and logging go to stderr.
 
 ## Sample output
 

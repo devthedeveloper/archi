@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2851,5 +2852,654 @@ func TestMemoryInDesignMessage(t *testing.T) {
 	}
 	if strings.Contains(designUserMessage("P", "M", "", "", nil, "R"), "TEAM MEMORY") {
 		t.Error("empty memory must add nothing")
+	}
+}
+
+// ── Phase 5: MCP server ─────────────────────────────────────────────────────
+
+// newTestMCPServer builds a server rooted at root; a non-nil provider is
+// scripted in place of newProvider.
+func newTestMCPServer(t *testing.T, root string, p Provider) *mcpServer {
+	t.Helper()
+	srv, err := newMCPServer(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p != nil {
+		srv.mk = func(string, string, float64, int) (Provider, error) { return p, nil }
+	}
+	return srv
+}
+
+// runServe feeds newline-delimited JSON through serve and returns every
+// stdout line parsed. Any stdout line that is not valid JSON fails the test —
+// protocol purity is part of every assertion.
+func runServe(t *testing.T, srv *mcpServer, input string) []map[string]any {
+	t.Helper()
+	var out bytes.Buffer
+	if err := srv.serve(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatalf("serve returned error: %v", err)
+	}
+	var msgs []map[string]any
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("stdout line is not JSON: %q (%v)", line, err)
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs
+}
+
+const mcpHandshake = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+`
+
+// mcpCall renders one tools/call line.
+func mcpCall(t *testing.T, id int, tool string, args map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":%s}}`, id, tool, raw) + "\n"
+}
+
+// mcpResponse finds the response with the given id.
+func mcpResponse(t *testing.T, msgs []map[string]any, id float64) map[string]any {
+	t.Helper()
+	for _, m := range msgs {
+		if v, ok := m["id"].(float64); ok && v == id {
+			return m
+		}
+	}
+	t.Fatalf("no response with id %v in %v", id, msgs)
+	return nil
+}
+
+// mcpErrCode returns the JSON-RPC error code of the response with id.
+func mcpErrCode(t *testing.T, msgs []map[string]any, id float64) float64 {
+	t.Helper()
+	m := mcpResponse(t, msgs, id)
+	e, ok := m["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("response %v has no error object: %v", id, m)
+	}
+	return e["code"].(float64)
+}
+
+// mcpToolText returns the concatenated text content and isError flag of a
+// tools/call response.
+func mcpToolText(t *testing.T, msgs []map[string]any, id float64) (string, bool) {
+	t.Helper()
+	m := mcpResponse(t, msgs, id)
+	res, ok := m["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("response %v has no result: %v", id, m)
+	}
+	var b strings.Builder
+	for _, c := range res["content"].([]any) {
+		b.WriteString(c.(map[string]any)["text"].(string))
+		b.WriteString("\n")
+	}
+	isErr, _ := res["isError"].(bool)
+	return b.String(), isErr
+}
+
+// mcpTempDir is t.TempDir with symlinks resolved, so paths compare cleanly
+// against the server's resolved root (macOS keeps /tmp behind a symlink).
+func mcpTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// mcpRepo fabricates an initialized repo: two Go files plus a coherent .archi
+// cache (config, profile, map, fingerprint) and one saved design.
+func mcpRepo(t *testing.T) string {
+	t.Helper()
+	dir := mcpTempDir(t)
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("main.go", "package main\n\nfunc main() {}\n")
+	write("util/helper.go", "package util\n\nfunc Help() string { return \"x\" }\n")
+	files, err := scanRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(archiDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{Version: version, Provider: "ollama", Model: "fake-1", Root: dir,
+		InitializedAt: "2026-07-01T00:00:00Z", Languages: map[string]int{"Go": 40},
+		FileCount: len(files), ApproxTokens: 40}
+	if err := cfg.save(dir); err != nil {
+		t.Fatal(err)
+	}
+	write(".archi/profile.md", "# Profile\n\nA small Go CLI.\n")
+	write(".archi/map.md", "# Map\n\n- main.go\n- util/helper.go\n")
+	if err := writeFingerprint(dir, buildFingerprint(dir, files)); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	hp := designHistoryPath(dir, "add webhooks", stamp)
+	if err := writeDesignHistory(hp, "add webhooks", "ollama/fake-1", stamp, false, "# design\n"); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// fileBlockOut renders a builder response containing one FILE block.
+func fileBlockOut(path, content string) string {
+	return "=== FILE: " + path + " ===\n```go\n" + content + "\n```\n"
+}
+
+// T1: initialize handshake, serverInfo, capabilities, ping.
+func TestMCPHandshake(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs := runServe(t, srv, mcpHandshake+`{"jsonrpc":"2.0","id":2,"method":"ping"}`+"\n")
+	res := mcpResponse(t, msgs, 1)["result"].(map[string]any)
+	if res["protocolVersion"] != "2025-06-18" {
+		t.Errorf("protocolVersion = %v", res["protocolVersion"])
+	}
+	si := res["serverInfo"].(map[string]any)
+	if si["name"] != "archi" || si["version"] != version {
+		t.Errorf("serverInfo = %v", si)
+	}
+	tools, ok := res["capabilities"].(map[string]any)["tools"].(map[string]any)
+	if !ok || tools["listChanged"] != false {
+		t.Errorf("capabilities = %v", res["capabilities"])
+	}
+	if pr, ok := mcpResponse(t, msgs, 2)["result"].(map[string]any); !ok || len(pr) != 0 {
+		t.Errorf("ping result should be {}, got %v", pr)
+	}
+}
+
+// T2: the version negotiation table.
+func TestMCPNegotiateProtocol(t *testing.T) {
+	cases := []struct{ client, want string }{
+		{"2025-06-18", "2025-06-18"},
+		{"2025-03-26", "2025-03-26"},
+		{"2024-11-05", "2024-11-05"},
+		{"2030-01-01", "2025-06-18"},
+		{"", "2025-06-18"},
+	}
+	for _, c := range cases {
+		if got := negotiateProtocol(c.client); got != c.want {
+			t.Errorf("negotiateProtocol(%q) = %q, want %q", c.client, got, c.want)
+		}
+	}
+}
+
+// T3: requests before notifications/initialized are rejected.
+func TestMCPPreInitRequest(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":3,"method":"tools/list"}
+`
+	msgs := runServe(t, srv, input)
+	if code := mcpErrCode(t, msgs, 2); code != -32600 {
+		t.Errorf("pre-init tools/list code = %v, want -32600", code)
+	}
+	if _, ok := mcpResponse(t, msgs, 3)["result"]; !ok {
+		t.Error("post-init tools/list should succeed")
+	}
+}
+
+// T4: unknown methods error; unknown notifications are silent.
+func TestMCPUnknownMethodAndNotification(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs := runServe(t, srv, mcpHandshake+
+		`{"jsonrpc":"2.0","id":2,"method":"foo/bar"}`+"\n"+
+		`{"jsonrpc":"2.0","method":"notifications/whatever"}`+"\n")
+	if code := mcpErrCode(t, msgs, 2); code != -32601 {
+		t.Errorf("unknown method code = %v, want -32601", code)
+	}
+	if len(msgs) != 2 { // initialize reply + foo/bar error, nothing else
+		t.Errorf("unknown notification must produce no output; got %d messages: %v", len(msgs), msgs)
+	}
+}
+
+// T5: unparseable lines and batch arrays.
+func TestMCPParseAndBatch(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs := runServe(t, srv, "this is not json\n"+`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`+"\n")
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 error responses, got %d: %v", len(msgs), msgs)
+	}
+	if code := msgs[0]["error"].(map[string]any)["code"].(float64); code != -32700 {
+		t.Errorf("garbage line code = %v, want -32700", code)
+	}
+	if id, present := msgs[0]["id"]; !present || id != nil {
+		t.Errorf("parse-error id should be null, got %v", id)
+	}
+	if code := msgs[1]["error"].(map[string]any)["code"].(float64); code != -32600 {
+		t.Errorf("batch code = %v, want -32600", code)
+	}
+}
+
+// T6: tools/list ordering, schemas, and hook gating.
+func TestMCPToolsList(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs := runServe(t, srv, mcpHandshake+`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`+"\n")
+	tools := mcpResponse(t, msgs, 2)["result"].(map[string]any)["tools"].([]any)
+	want := []string{"archi_status", "archi_init", "archi_design", "archi_build", "archi_review", "archi_rollback"}
+	if len(tools) != len(want) {
+		t.Fatalf("want %d tools, got %d", len(want), len(tools))
+	}
+	for i, w := range want {
+		tool := tools[i].(map[string]any)
+		if tool["name"] != w {
+			t.Errorf("tool %d = %v, want %s", i, tool["name"], w)
+		}
+		schema, ok := tool["inputSchema"].(map[string]any)
+		if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+			t.Errorf("%s inputSchema malformed: %v", w, tool["inputSchema"])
+		}
+		if tool["description"] == "" {
+			t.Errorf("%s has no description", w)
+		}
+	}
+
+	// With the phase hooks unregistered, the gated tools disappear and calling
+	// one fails exactly like any unknown tool.
+	savedReview, savedRollback := serveReviewCore, serveRollbackCore
+	serveReviewCore, serveRollbackCore = nil, nil
+	defer func() { serveReviewCore, serveRollbackCore = savedReview, savedRollback }()
+	srv2 := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs2 := runServe(t, srv2, mcpHandshake+
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`+"\n"+
+		mcpCall(t, 3, "archi_rollback", map[string]any{"list": true}))
+	tools2 := mcpResponse(t, msgs2, 2)["result"].(map[string]any)["tools"].([]any)
+	if len(tools2) != 4 {
+		t.Errorf("ungated build should list 4 tools, got %d", len(tools2))
+	}
+	if code := mcpErrCode(t, msgs2, 3); code != -32602 {
+		t.Errorf("gated-off tool call code = %v, want -32602", code)
+	}
+}
+
+// T7: schema-shape violations are -32602, per tool.
+func TestMCPSchemaRejections(t *testing.T) {
+	srv := newTestMCPServer(t, mcpRepo(t), &fakeProvider{out: "x"})
+	cases := []struct {
+		name, tool, args string
+	}{
+		{"missing request", "archi_design", `{}`},
+		{"wrong-typed refresh", "archi_init", `{"refresh":"yes"}`},
+		{"unknown field", "archi_status", `{"bogus":1}`},
+		{"bad agents enum", "archi_design", `{"request":"x","agents":"turbo"}`},
+		{"max_tokens below range", "archi_design", `{"request":"x","max_tokens":64}`},
+		{"bad rollback stamp", "archi_rollback", `{"run":"2026-01-01"}`},
+	}
+	var input strings.Builder
+	input.WriteString(mcpHandshake)
+	for i, c := range cases {
+		fmt.Fprintf(&input, `{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":%s}}`+"\n", i+10, c.tool, c.args)
+	}
+	msgs := runServe(t, srv, input.String())
+	for i, c := range cases {
+		if code := mcpErrCode(t, msgs, float64(i+10)); code != -32602 {
+			t.Errorf("%s: code = %v, want -32602", c.name, code)
+		}
+	}
+}
+
+// T8: semantic conflicts are tool errors (isError), not -32602.
+func TestMCPSemanticArgErrors(t *testing.T) {
+	srv := newTestMCPServer(t, mcpRepo(t), &fakeProvider{out: "x"})
+	input := mcpHandshake +
+		mcpCall(t, 2, "archi_init", map[string]any{"refresh": true, "force": true}) +
+		mcpCall(t, 3, "archi_build", map[string]any{"design": "d", "design_file": "f.md"}) +
+		mcpCall(t, 4, "archi_build", map[string]any{})
+	msgs := runServe(t, srv, input)
+	for _, id := range []float64{2, 3, 4} {
+		if text, isErr := mcpToolText(t, msgs, id); !isErr {
+			t.Errorf("id %v: want isError:true, got success %q", id, text)
+		}
+	}
+}
+
+// T9: archi_status happy path over a fabricated cache.
+func TestMCPStatusHappyPath(t *testing.T) {
+	srv := newTestMCPServer(t, mcpRepo(t), nil)
+	msgs := runServe(t, srv, mcpHandshake+mcpCall(t, 2, "archi_status", map[string]any{}))
+	text, isErr := mcpToolText(t, msgs, 2)
+	if isErr {
+		t.Fatalf("status errored: %s", text)
+	}
+	for _, want := range []string{"ollama/fake-1", "add-webhooks", "draft", "Go"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("status missing %q in:\n%s", want, text)
+		}
+	}
+
+	// An uninitialized path is a domain error naming the fix.
+	srv2 := newTestMCPServer(t, mcpTempDir(t), nil)
+	msgs2 := runServe(t, srv2, mcpHandshake+mcpCall(t, 2, "archi_status", map[string]any{}))
+	if text2, isErr2 := mcpToolText(t, msgs2, 2); !isErr2 || !strings.Contains(text2, "archi_init") {
+		t.Errorf("uninitialized status: isError=%v text=%q", isErr2, text2)
+	}
+}
+
+// snapshotWorkTree maps rel path → content for everything outside .archi.
+func snapshotWorkTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	m := map[string]string{}
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == archiDirName || strings.HasPrefix(rel, archiDirName+"/") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		m[rel] = string(data)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// T10: the default archi_build is a dry run — diffs out, nothing written.
+func TestMCPBuildDryRunWritesNothing(t *testing.T) {
+	dir := mcpRepo(t)
+	srv := newTestMCPServer(t, dir, &fakeProvider{out: fileBlockOut("a/b.go", "package b") + fileBlockOut("main.go", "package main\n\nfunc main() { println(1) }")})
+	before := snapshotWorkTree(t, dir)
+	msgs := runServe(t, srv, mcpHandshake+mcpCall(t, 2, "archi_build", map[string]any{"design": "# design\n\ncreate a/b.go and touch main.go"}))
+	text, isErr := mcpToolText(t, msgs, 2)
+	if isErr {
+		t.Fatalf("dry run errored: %s", text)
+	}
+	for _, want := range []string{"dry run", "a/b.go", "create", "overwrite", "```diff"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("dry-run output missing %q in:\n%s", want, text)
+		}
+	}
+	after := snapshotWorkTree(t, dir)
+	if len(after) != len(before) {
+		t.Errorf("tree changed: %d files before, %d after", len(before), len(after))
+	}
+	for rel, content := range before {
+		if after[rel] != content {
+			t.Errorf("file %s changed during dry run", rel)
+		}
+	}
+	if _, err := os.Stat(backupsRoot(dir)); !os.IsNotExist(err) {
+		t.Error("dry run must not create .archi/backups")
+	}
+}
+
+// T11: dry_run:false writes files with a manifest; a dirty repo without
+// allow_dirty is refused.
+func TestMCPBuildWritesAndBacksUp(t *testing.T) {
+	dir := mcpRepo(t)
+	srv := newTestMCPServer(t, dir, &fakeProvider{out: fileBlockOut("a/b.go", "package b")})
+	msgs := runServe(t, srv, mcpHandshake+mcpCall(t, 2, "archi_build",
+		map[string]any{"design": "d", "dry_run": false, "allow_dirty": true}))
+	text, isErr := mcpToolText(t, msgs, 2)
+	if isErr {
+		t.Fatalf("build errored: %s", text)
+	}
+	if !strings.Contains(text, "Wrote 1 files") {
+		t.Errorf("build result missing write count:\n%s", text)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "a", "b.go")); err != nil || string(data) != "package b\n" {
+		t.Errorf("a/b.go = %q, %v", data, err)
+	}
+	runs := listBackupRuns(backupsRoot(dir))
+	if len(runs) != 1 || runs[0].created != 1 {
+		t.Errorf("backup runs = %+v, want one run recording one created file", runs)
+	}
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir2 := mcpRepo(t)
+	if out, err := exec.Command("git", "-C", dir2, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init failed: %v (%s)", err, out)
+	}
+	srv2 := newTestMCPServer(t, dir2, &fakeProvider{out: fileBlockOut("a/b.go", "package b")})
+	msgs2 := runServe(t, srv2, mcpHandshake+mcpCall(t, 2, "archi_build", map[string]any{"design": "d", "dry_run": false}))
+	if text2, isErr2 := mcpToolText(t, msgs2, 2); !isErr2 || !strings.Contains(text2, "uncommitted") {
+		t.Errorf("dirty repo build: isError=%v text=%q", isErr2, text2)
+	}
+	if _, err := os.Stat(filepath.Join(dir2, "a", "b.go")); !os.IsNotExist(err) {
+		t.Error("dirty-repo refusal must not write files")
+	}
+}
+
+// T12: adversarial paths never leave the -root confinement.
+func TestMCPRootConfinement(t *testing.T) {
+	dir := mcpRepo(t)
+	if err := os.Symlink(filepath.Dir(dir), filepath.Join(dir, "esc")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	srv := newTestMCPServer(t, dir, nil)
+	input := mcpHandshake +
+		mcpCall(t, 2, "archi_status", map[string]any{"path": "../x"}) +
+		mcpCall(t, 3, "archi_status", map[string]any{"path": "/etc"}) +
+		mcpCall(t, 4, "archi_build", map[string]any{"design_file": "../../d.md"}) +
+		mcpCall(t, 5, "archi_status", map[string]any{"path": "esc"})
+	msgs := runServe(t, srv, input)
+	for _, id := range []float64{2, 3, 4, 5} {
+		if text, isErr := mcpToolText(t, msgs, id); !isErr {
+			t.Errorf("id %v should be a tool error, got %q", id, text)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "x")); !os.IsNotExist(err) {
+		t.Error("nothing may be created outside the root")
+	}
+}
+
+// T13: archi_design returns the doc plus a saved-history item; the file lands
+// under .archi/designs; stdout stayed pure JSON (runServe enforces).
+func TestMCPDesignSavesHistory(t *testing.T) {
+	dir := mcpRepo(t)
+	srv := newTestMCPServer(t, dir, &fakeProvider{out: "# Design: webhooks\n\nBody."})
+	msgs := runServe(t, srv, mcpHandshake+mcpCall(t, 2, "archi_design",
+		map[string]any{"request": "add webhooks with retries", "agents": "fast"}))
+	res, ok := mcpResponse(t, msgs, 2)["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("no result: %v", msgs)
+	}
+	if isErr, _ := res["isError"].(bool); isErr {
+		t.Fatalf("design errored: %v", res)
+	}
+	content := res["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("want 2 content items, got %d: %v", len(content), content)
+	}
+	first := content[0].(map[string]any)["text"].(string)
+	second := content[1].(map[string]any)["text"].(string)
+	if !strings.Contains(first, "# Design: webhooks") {
+		t.Errorf("first item is not the design doc: %q", first)
+	}
+	if !strings.HasPrefix(second, "Saved to .archi/designs/") {
+		t.Fatalf("second item = %q", second)
+	}
+	saved := strings.TrimPrefix(second, "Saved to ")
+	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(saved))); err != nil {
+		t.Errorf("saved design missing: %v", err)
+	}
+}
+
+// T14: EOF mid-session shuts down cleanly; ARCHI_TIMEOUT caps a slow call.
+func TestMCPEOFAndTimeout(t *testing.T) {
+	srv := newTestMCPServer(t, mcpTempDir(t), nil)
+	runServe(t, srv, mcpHandshake) // input ends mid-session: serve must return nil
+
+	t.Setenv("ARCHI_TIMEOUT", "1ns")
+	srv2 := newTestMCPServer(t, mcpRepo(t), &fakeProvider{out: "x", delay: 50 * time.Millisecond})
+	msgs := runServe(t, srv2, mcpHandshake+mcpCall(t, 2, "archi_design", map[string]any{"request": "r", "agents": "fast"}))
+	if text, isErr := mcpToolText(t, msgs, 2); !isErr || !strings.Contains(text, "deadline") {
+		t.Errorf("timeout: isError=%v text=%q", isErr, text)
+	}
+}
+
+// T15: archi_init emits progress notifications iff a progressToken was sent.
+func TestMCPInitProgress(t *testing.T) {
+	dir := mcpTempDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestMCPServer(t, dir, &fakeProvider{out: "# Profile\n\nA Go CLI.\n"})
+	call := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"archi_init","arguments":{},"_meta":{"progressToken":7}}}` + "\n"
+	msgs := runServe(t, srv, mcpHandshake+call)
+	progress, respIdx := 0, -1
+	for i, m := range msgs {
+		if m["method"] == "notifications/progress" {
+			params := m["params"].(map[string]any)
+			if tok := params["progressToken"].(float64); tok != 7 {
+				t.Errorf("progressToken = %v, want 7", tok)
+			}
+			if respIdx != -1 {
+				t.Error("progress notification after the response")
+			}
+			progress++
+		}
+		if v, ok := m["id"].(float64); ok && v == 2 {
+			respIdx = i
+		}
+	}
+	if progress < 2 {
+		t.Errorf("want ≥2 progress notifications, got %d", progress)
+	}
+	text, isErr := mcpToolText(t, msgs, 2)
+	if isErr || !strings.Contains(text, "Learned") {
+		t.Errorf("init result: isError=%v text=%q", isErr, text)
+	}
+	if !isInitialized(dir) {
+		t.Error("init did not write .archi")
+	}
+
+	// Without a token the handlers degrade silently: no notifications.
+	dir2 := mcpTempDir(t)
+	if err := os.WriteFile(filepath.Join(dir2, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv2 := newTestMCPServer(t, dir2, &fakeProvider{out: "# Profile\n"})
+	for _, m := range runServe(t, srv2, mcpHandshake+mcpCall(t, 2, "archi_init", map[string]any{})) {
+		if m["method"] == "notifications/progress" {
+			t.Error("no progressToken ⇒ no progress notifications")
+		}
+	}
+}
+
+// T16: previewChanges + writeChanges compose to the old applyChanges effects.
+func TestPreviewWriteEqualsApply(t *testing.T) {
+	mkFixture := func() string {
+		dir := t.TempDir()
+		for rel, content := range map[string]string{"old.txt": "old\n", "gone.txt": "bye\n"} {
+			if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	changes := []fileChange{
+		{path: "old.txt", content: "new content"},
+		{path: "fresh/new.txt", content: "created"},
+		{path: "gone.txt", del: true},
+		{path: "../evil.txt", content: "nope"},
+	}
+
+	dirA := mkFixture()
+	applied, stampA, err := applyChanges(dirA, append([]fileChange(nil), changes...), true)
+	if err != nil || !applied || stampA == "" {
+		t.Fatalf("applyChanges: applied=%v stamp=%q err=%v", applied, stampA, err)
+	}
+
+	dirB := mkFixture()
+	valid, previews, skipped := previewChanges(dirB, append([]fileChange(nil), changes...))
+	if len(skipped) != 1 || skipped[0] != "../evil.txt" {
+		t.Errorf("skipped = %v", skipped)
+	}
+	wantKinds := []string{"overwrite", "create", "delete"}
+	if len(previews) != len(wantKinds) {
+		t.Fatalf("previews = %+v", previews)
+	}
+	for i, k := range wantKinds {
+		if previews[i].Kind != k {
+			t.Errorf("preview %d kind = %s, want %s", i, previews[i].Kind, k)
+		}
+	}
+	if previews[0].Diff == "" || previews[1].Diff != "" || previews[2].Diff != "" {
+		t.Errorf("only overwrites carry diffs: %+v", previews)
+	}
+	written, backupDir, err := writeChanges(dirB, valid, time.Now())
+	if err != nil || written != 3 || backupDir == "" {
+		t.Fatalf("writeChanges: written=%d backupDir=%q err=%v", written, backupDir, err)
+	}
+
+	// Same working-tree effects...
+	for _, dir := range []string{dirA, dirB} {
+		if data, err := os.ReadFile(filepath.Join(dir, "old.txt")); err != nil || string(data) != "new content\n" {
+			t.Errorf("%s old.txt = %q, %v", dir, data, err)
+		}
+		if data, err := os.ReadFile(filepath.Join(dir, "fresh", "new.txt")); err != nil || string(data) != "created\n" {
+			t.Errorf("%s fresh/new.txt = %q, %v", dir, data, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "gone.txt")); !os.IsNotExist(err) {
+			t.Errorf("%s gone.txt should be deleted", dir)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "..", "evil.txt")); !os.IsNotExist(err) {
+			t.Errorf("%s escaped the root", dir)
+		}
+	}
+
+	// ...and identical backup manifests plus backed-up originals.
+	readManifest := func(dir string) string {
+		runs := listBackupRuns(backupsRoot(dir))
+		if len(runs) != 1 {
+			t.Fatalf("%s backup runs = %+v", dir, runs)
+		}
+		data, err := os.ReadFile(filepath.Join(backupsRoot(dir), runs[0].stamp, "manifest.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	mA, mB := readManifest(dirA), readManifest(dirB)
+	if mA != mB {
+		t.Errorf("manifests differ:\nA: %q\nB: %q", mA, mB)
+	}
+	for _, rel := range []string{"old.txt", "gone.txt"} {
+		runsB := listBackupRuns(backupsRoot(dirB))
+		data, err := os.ReadFile(filepath.Join(backupsRoot(dirB), runsB[0].stamp, rel))
+		if err != nil {
+			t.Errorf("backup of %s missing: %v", rel, err)
+		} else if want := map[string]string{"old.txt": "old\n", "gone.txt": "bye\n"}[rel]; string(data) != want {
+			t.Errorf("backup of %s = %q, want %q", rel, data, want)
+		}
 	}
 }

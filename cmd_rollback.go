@@ -111,6 +111,45 @@ func restoreRun(root, runDir string, restore, created []string) error {
 	return nil
 }
 
+// Registering here lights up the archi_rollback MCP tool whenever this file
+// is in the build (cmd_serve.go omits the tool while the hook is nil).
+func init() { serveRollbackCore = rollbackCoreForServe }
+
+// rollbackCoreForServe is the confirmation-free rollback behind the
+// archi_rollback MCP tool: the tool call itself is the confirmation, and
+// list:true is the dry-run inspection. Having no backups is a normal answer,
+// not an error.
+func rollbackCoreForServe(root, run string, list bool) (string, error) {
+	dir := backupsRoot(root)
+	runs := listBackupRuns(dir)
+	if len(runs) == 0 {
+		return "no backups found", nil
+	}
+	if list {
+		var b strings.Builder
+		b.WriteString("| run | restorable | created |\n|---|---|---|\n")
+		for _, r := range runs {
+			fmt.Fprintf(&b, "| %s | %d | %d |\n", r.stamp, r.restored, r.created)
+		}
+		return b.String(), nil
+	}
+	stamp := run
+	if stamp == "" {
+		stamp = runs[0].stamp
+	}
+	runDir := filepath.Join(dir, stamp)
+	data, err := os.ReadFile(filepath.Join(runDir, "manifest.txt"))
+	if err != nil {
+		return "", fmt.Errorf("no such backup run: %s", stamp)
+	}
+	restore, created := parseManifest(data)
+	if err := restoreRun(root, runDir, restore, created); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Restored %d files and deleted %d created files from backup run %s.",
+		len(restore), len(created), stamp), nil
+}
+
 func cmdRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
 	runStamp := fs.String("run", "", "restore this backup run (default: newest)")
