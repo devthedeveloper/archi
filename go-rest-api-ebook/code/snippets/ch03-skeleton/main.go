@@ -4,7 +4,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -54,30 +53,4 @@ func main() {
 	err := srv.ListenAndServe()
 	logger.Error("server stopped", "error", err)
 	os.Exit(1)
-}
-
-// routes builds the router. It grows a line or two every chapter.
-func (app *application) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/healthz", app.healthzHandler)
-	return mux
-}
-
-// healthzHandler — GET /api/v1/healthz
-func (app *application) healthzHandler(w http.ResponseWriter, r *http.Request) {
-	data := map[string]string{
-		"status":      "available",
-		"environment": app.config.env,
-		"version":     version,
-	}
-
-	js, err := json.Marshal(data)
-	if err != nil {
-		app.logger.Error("marshal failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(js)
 }

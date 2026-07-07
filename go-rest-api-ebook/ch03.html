@@ -80,13 +80,12 @@ simple: <span class="hl y">put the shared stuff in one struct, and make your han
 it</span>.</p>
 
 <div class="code-card"><span class="filename new">cmd/api/main.go</span>
-<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#L1-L57">// Chapter 3 checkpoint: the project skeleton, before the database
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go">// Chapter 3 checkpoint: the project skeleton, before the database
 // (chapter 5), JSON helpers (chapter 4) and graceful shutdown
 // (chapter 12) get added.
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -166,7 +165,11 @@ func main() {
 map on one page is a gift to future-you:</p>
 
 <div class="code-card"><span class="filename new">cmd/api/routes.go</span>
-<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#func routes">// routes builds the router. It grows a line or two every chapter.
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/routes.go">package main
+
+import "net/http"
+
+// routes builds the router. It grows a line or two every chapter.
 func (app *application) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/healthz", app.healthzHandler)
@@ -178,7 +181,14 @@ func (app *application) routes() http.Handler {
 it, uptime bots ping it, you ping it at 2 a.m.):</p>
 
 <div class="code-card"><span class="filename new">cmd/api/healthz.go</span>
-<pre><code class="lang-go" data-src="snippets:ch03-skeleton/main.go#func healthzHandler">// healthzHandler — GET /api/v1/healthz
+<pre><code class="lang-go" data-src="snippets:ch03-skeleton/healthz.go">package main
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// healthzHandler — GET /api/v1/healthz
 func (app *application) healthzHandler(w http.ResponseWriter, r *http.Request) {
 	data := map[string]string{
 		"status":      "available",
@@ -196,6 +206,18 @@ func (app *application) healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(js)
 }</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="box-title">Every .go file begins with package main</span>
+  <p>See how <code>routes.go</code> and <code>healthz.go</code> above each open with
+  <code>package main</code> and their own <code>import</code> block? That first line is not
+  optional — a Go file missing it fails to compile with the cryptic
+  <code>expected 'package', found 'func'</code>. Every file in one folder shares the same package,
+  so <em>all three</em> files in <code>cmd/api/</code> start with <code>package main</code>. When a
+  later card is labelled <b>new file</b> but only shows a function to save space, keep its
+  <code>package</code> line and imports at the top. <span class="hl y">Stuck? The complete,
+  compiling file is always in <a href="code/gopherit/">code/gopherit/</a>.</span></p>
 </div>
 
 <div class="term-card"><div class="term-bar"><i></i><i></i><i></i><span>terminal</span></div>
